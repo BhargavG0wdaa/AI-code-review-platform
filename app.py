@@ -153,6 +153,9 @@ def format_comment(result: dict) -> str:
     sup = result.get("suppressed", 0)
     ref = len(result.get("refuted", []))
     notes = []
+    planned = result.get("planned_agents")
+    if planned:
+        notes.append(f"agents: {', '.join(planned)}")
     if sup:
         notes.append(f"{sup} low-confidence finding(s) suppressed")
     if ref:

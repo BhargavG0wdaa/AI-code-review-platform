@@ -286,6 +286,40 @@ def build_specialist_prompt(name: str, focus: str) -> str:
     )
 
 
+# Phase 4b: the planner reads the diff and picks which specialists are worth
+# running. One cheap call up front avoids paying for specialists (and the
+# verifier calls their findings trigger) that have nothing to look at.
+PLANNER_SYSTEM_PROMPT = """You are the planner for a code review system. Given a PR diff, decide which specialist reviewers are worth running.
+
+Available specialists:
+- security: injection, hardcoded secrets, unsafe deserialization, auth gaps
+- performance: N+1 queries, loops, algorithmic complexity, blocking I/O, caching
+- architecture: design, coupling, duplication, error handling, naming
+- testing: edge cases, boundary conditions, correctness, missing tests
+- docs: public API docstrings, type hints, naming clarity
+
+Include a specialist if there is a REASONABLE chance it finds something in THIS diff. Skip only the clearly irrelevant ones (e.g. skip 'performance' if there are no loops/queries/I/O; skip 'docs' if no public API or signatures changed). When unsure, INCLUDE it. Security should almost always run.
+
+Respond with ONLY valid JSON:
+{
+  "agents": ["security", "testing"],
+  "reasoning": "one short line on what you skipped and why"
+}"""
+
+
+def plan_specialists(diff: str, static_findings: list | None = None) -> list:
+    """Ask the planner which specialists to run. Falls back to ALL specialists
+    on any problem — skipping a relevant reviewer is worse than running an
+    extra one."""
+    valid = {s["name"] for s in SPECIALISTS}
+    try:
+        result = _chat_json(PLANNER_SYSTEM_PROMPT, build_user_prompt(diff, static_findings))
+    except ReviewError:
+        return [s["name"] for s in SPECIALISTS]
+    chosen = [a for a in result.get("agents", []) if a in valid]
+    return chosen or [s["name"] for s in SPECIALISTS]  # never run zero agents
+
+
 def build_user_prompt(diff: str, static_findings: list | None = None) -> str:
     truncated = diff[:MAX_DIFF_CHARS]
     note = ""
@@ -361,13 +395,16 @@ def _run_specialist(spec: dict, user_prompt: str) -> dict:
     return result
 
 
-def review_all_specialists(diff: str, static_findings: list | None = None) -> dict:
-    """Phase 4 orchestrator: fan out to all specialists IN PARALLEL, then merge
-    their findings. Wall-clock ≈ one LLM call, not five, because they run
-    concurrently in a thread pool (the Groq SDK calls are blocking I/O)."""
+def review_all_specialists(diff: str, static_findings: list | None = None,
+                           only: list | None = None) -> dict:
+    """Phase 4 orchestrator: fan out to the chosen specialists IN PARALLEL, then
+    merge their findings. Wall-clock ≈ one LLM call, not N, because they run
+    concurrently in a thread pool (the Groq SDK calls are blocking I/O).
+    `only` restricts to a subset of specialist names (chosen by the planner)."""
+    specs = [s for s in SPECIALISTS if only is None or s["name"] in only]
     user_prompt = build_user_prompt(diff, static_findings)
-    with ThreadPoolExecutor(max_workers=len(SPECIALISTS)) as ex:
-        results = list(ex.map(lambda s: _run_specialist(s, user_prompt), SPECIALISTS))
+    with ThreadPoolExecutor(max_workers=max(1, len(specs))) as ex:
+        results = list(ex.map(lambda s: _run_specialist(s, user_prompt), specs))
 
     findings: list[dict] = []
     rejected: list[dict] = []
@@ -499,8 +536,10 @@ def run_review(diff: str, static_findings: list | None = None) -> dict:
     and are auto-confirmed; only the LLM's probabilistic findings get verified.
     """
     static_findings = static_findings or []
-    # Phase 4: fan out to parallel specialist agents instead of one generalist.
-    review = review_all_specialists(diff, static_findings)
+    # Phase 4b: planner picks which specialists are worth running for this diff.
+    planned = plan_specialists(diff, static_findings)
+    # Phase 4: fan out to the chosen specialist agents in parallel.
+    review = review_all_specialists(diff, static_findings, only=planned)
     # Specialists overlap — merge duplicates before paying to verify them.
     review["findings"] = dedup_findings(review.get("findings", []))
     candidates, suppressed = select_candidates(review)
@@ -524,6 +563,7 @@ def run_review(diff: str, static_findings: list | None = None) -> dict:
         "suppressed": suppressed,
         "rejected": review.get("rejected", []),
         "static_count": len(static_findings),
+        "planned_agents": planned,
     }
 
 
@@ -545,6 +585,15 @@ def print_review(result: dict, pr_label: str) -> None:
 
     console.print(Panel(result.get("summary") or "(no summary)",
                         title=f"Review of {pr_label}", border_style="blue"))
+
+    planned = result.get("planned_agents")
+    if planned:
+        all_names = [s["name"] for s in SPECIALISTS]
+        skipped = [n for n in all_names if n not in planned]
+        line = f"[dim]Planner ran: {', '.join(planned)}[/dim]"
+        if skipped:
+            line += f" [dim](skipped: {', '.join(skipped)})[/dim]"
+        console.print(line)
 
     if not confirmed:
         console.print("[green]No findings survived verification. Looks clean.[/green]")
