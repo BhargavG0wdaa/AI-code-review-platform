@@ -42,6 +42,14 @@ MIN_CONFIDENCE = "high"
 _CONFIDENCE_RANK = {"high": 0, "medium": 1, "low": 2}
 
 
+class ReviewError(Exception):
+    """Raised when the review can't proceed (bad URL, fetch failure, bad model
+    output). Reusable callers (CLI, web server) catch this and decide what to do.
+    We raise instead of calling sys.exit() so library code never kills its host
+    process — that distinction matters once a web server imports these functions.
+    """
+
+
 # ---------------------------------------------------------------------------
 # 1. Fetch the PR diff from GitHub
 # ---------------------------------------------------------------------------
@@ -49,7 +57,7 @@ def parse_pr_url(url: str) -> tuple[str, str, int]:
     """Pull (owner, repo, pr_number) out of a GitHub PR URL."""
     match = re.search(r"github\.com/([^/]+)/([^/]+)/pull/(\d+)", url)
     if not match:
-        sys.exit(f"Not a valid GitHub PR URL: {url}")
+        raise ReviewError(f"Not a valid GitHub PR URL: {url}")
     owner, repo, number = match.groups()
     return owner, repo, int(number)
 
@@ -69,9 +77,9 @@ def fetch_diff(owner: str, repo: str, number: int) -> str:
 
     resp = httpx.get(url, headers=headers, timeout=30, follow_redirects=True)
     if resp.status_code == 404:
-        sys.exit("PR not found (private repo without a token, or bad URL).")
+        raise ReviewError("PR not found (private repo without a token, or bad URL).")
     if resp.status_code == 403:
-        sys.exit("GitHub rate-limited you. Add a GITHUB_TOKEN to .env.")
+        raise ReviewError("GitHub rate-limited you or denied access. Add/refresh GITHUB_TOKEN in .env.")
     resp.raise_for_status()
     return resp.text
 
@@ -178,10 +186,12 @@ def _chat_json(system: str, user: str) -> dict:
         ],
     )
     raw = response.choices[0].message.content
+    if not raw:
+        raise ReviewError("Model returned an empty response.")
     try:
         return json.loads(raw)
-    except json.JSONDecodeError:
-        sys.exit(f"Model did not return valid JSON:\n{raw}")
+    except json.JSONDecodeError as e:
+        raise ReviewError(f"Model did not return valid JSON: {e}\n{raw}")
 
 
 def review_diff(diff: str) -> dict:
@@ -229,13 +239,47 @@ def verify_finding(diff: str, finding: dict) -> dict:
     return _chat_json(VERIFIER_SYSTEM_PROMPT, user)
 
 
+def _norm(value: str | None) -> str:
+    """Normalize an LLM-provided label (severity/confidence) so 'High' == 'high'."""
+    return (value or "").strip().lower()
+
+
 def select_candidates(review: dict) -> tuple[list[dict], int]:
     """Apply the confidence filter. Returns (candidates, suppressed_count)."""
     all_findings = review.get("findings", [])
     cutoff = _CONFIDENCE_RANK[MIN_CONFIDENCE]
     candidates = [f for f in all_findings
-                  if _CONFIDENCE_RANK.get(f.get("confidence", "low"), 9) <= cutoff]
+                  if _CONFIDENCE_RANK.get(_norm(f.get("confidence")), 9) <= cutoff]
     return candidates, len(all_findings) - len(candidates)
+
+
+def run_review(diff: str) -> dict:
+    """The full pipeline as one callable: review -> confidence filter -> verify.
+
+    Returns a plain dict so ANY caller (CLI, web server, tests) can use it.
+    This is the seam that lets Phase 2 reuse everything we built in Phase 1:
+    "compute the result" is now separate from "display the result".
+    """
+    review = review_diff(diff)
+    candidates, suppressed = select_candidates(review)
+
+    confirmed: list[dict] = []
+    refuted: list[dict] = []
+    for f in candidates:
+        verdict = verify_finding(diff, f)
+        f["_verdict"] = verdict
+        if verdict.get("verdict") == "confirmed":
+            confirmed.append(f)
+        else:
+            refuted.append(f)
+
+    return {
+        "summary": review.get("summary", ""),
+        "confirmed": confirmed,
+        "refuted": refuted,
+        "suppressed": suppressed,
+        "rejected": review.get("rejected", []),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -249,9 +293,12 @@ SEVERITY_COLOR = {
 }
 
 
-def print_review(review: dict, pr_label: str, confirmed: list[dict],
-                 refuted: list[dict], suppressed: int) -> None:
-    console.print(Panel(review.get("summary", "(no summary)"),
+def print_review(result: dict, pr_label: str) -> None:
+    confirmed = result.get("confirmed", [])
+    refuted = result.get("refuted", [])
+    suppressed = result.get("suppressed", 0)
+
+    console.print(Panel(result.get("summary") or "(no summary)",
                         title=f"Review of {pr_label}", border_style="blue"))
 
     if not confirmed:
@@ -259,7 +306,7 @@ def print_review(review: dict, pr_label: str, confirmed: list[dict],
     else:
         # Sort most severe first.
         order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-        confirmed.sort(key=lambda f: order.get(f.get("severity", "low"), 9))
+        confirmed.sort(key=lambda f: order.get(_norm(f.get("severity")), 9))
 
         table = Table(show_lines=True)
         table.add_column("Severity")
@@ -268,7 +315,7 @@ def print_review(review: dict, pr_label: str, confirmed: list[dict],
         table.add_column("Issue, Evidence & Fix", max_width=80)
 
         for f in confirmed:
-            sev = f.get("severity", "low")
+            sev = _norm(f.get("severity")) or "low"
             color = SEVERITY_COLOR.get(sev, "white")
             conf = f.get("confidence", "?")
             location = f"{f.get('file', '?')}\n:{f.get('line', '?')}"
@@ -292,13 +339,12 @@ def print_review(review: dict, pr_label: str, confirmed: list[dict],
             reason = f.get("_verdict", {}).get("reasoning", "")
             console.print(f"  [red]✗[/red] [bold]{f.get('title', '')}[/bold]")
             console.print(f"    [dim]{reason}[/dim]")
-    _print_rejected(review)
+    _print_rejected(result.get("rejected", []))
 
 
-def _print_rejected(review: dict) -> None:
+def _print_rejected(rejected: list[dict]) -> None:
     """Show what the model's self-critique threw out. This is the hallucination
     guard working in the open — each one is a fake bug that didn't get shipped."""
-    rejected = review.get("rejected", [])
     if not rejected:
         return
     console.print(f"\n[dim]Self-critique dropped {len(rejected)} candidate(s) "
@@ -318,34 +364,21 @@ def main() -> None:
     if not os.getenv("GROQ_API_KEY"):
         sys.exit("Missing GROQ_API_KEY. Copy .env.example to .env and add your key.")
 
-    owner, repo, number = parse_pr_url(args.pr_url)
-    pr_label = f"{owner}/{repo}#{number}"
+    try:
+        owner, repo, number = parse_pr_url(args.pr_url)
+        pr_label = f"{owner}/{repo}#{number}"
 
-    with console.status(f"Fetching diff for {pr_label}..."):
-        diff = fetch_diff(owner, repo, number)
-    if not diff.strip():
-        sys.exit("That PR has an empty diff — nothing to review.")
+        with console.status(f"Fetching diff for {pr_label}..."):
+            diff = fetch_diff(owner, repo, number)
+        if not diff.strip():
+            raise ReviewError("That PR has an empty diff — nothing to review.")
 
-    with console.status(f"Reviewing with {MODEL}..."):
-        review = review_diff(diff)
+        with console.status(f"Reviewing + verifying with {MODEL}..."):
+            result = run_review(diff)
+    except ReviewError as e:
+        sys.exit(f"Error: {e}")
 
-    # Confidence filter first (cheap), then pay for verification only on the
-    # findings that survive it.
-    candidates, suppressed = select_candidates(review)
-
-    confirmed: list[dict] = []
-    refuted: list[dict] = []
-    if candidates:
-        with console.status(f"Verifying {len(candidates)} finding(s) adversarially..."):
-            for f in candidates:
-                verdict = verify_finding(diff, f)
-                f["_verdict"] = verdict
-                if verdict.get("verdict") == "confirmed":
-                    confirmed.append(f)
-                else:
-                    refuted.append(f)
-
-    print_review(review, pr_label, confirmed, refuted, suppressed)
+    print_review(result, pr_label)
 
 
 if __name__ == "__main__":
