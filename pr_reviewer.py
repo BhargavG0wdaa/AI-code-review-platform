@@ -23,6 +23,8 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from static_analysis import analyze_files
+
 load_dotenv()
 console = Console()
 
@@ -82,6 +84,89 @@ def fetch_diff(owner: str, repo: str, number: int) -> str:
         raise ReviewError("GitHub rate-limited you or denied access. Add/refresh GITHUB_TOKEN in .env.")
     resp.raise_for_status()
     return resp.text
+
+
+def added_line_numbers(patch: str) -> set:
+    """Parse a unified-diff patch and return the set of line numbers ADDED in
+    the new version of the file. Used to filter static findings down to lines
+    this PR actually touched (so we don't flag pre-existing issues)."""
+    added: set = set()
+    new_line = 0
+    for line in (patch or "").splitlines():
+        if line.startswith("@@"):
+            # Hunk header: @@ -old,n +new,n @@ — grab the new-file start line.
+            m = re.search(r"\+(\d+)", line)
+            new_line = int(m.group(1)) if m else 0
+        elif line.startswith("+"):
+            added.add(new_line)
+            new_line += 1
+        elif line.startswith("-"):
+            pass  # removed line — doesn't advance the new-file counter
+        else:
+            new_line += 1  # context line
+    return added
+
+
+def fetch_pr_files(owner: str, repo: str, number: int) -> dict:
+    """Return {path: {"content": <full file at PR head>, "added": {line nums}}}
+    for the Python files changed in the PR. Static tools need whole files (they
+    parse the AST), so we fetch each file's content, not just the diff hunk."""
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/files"
+    headers = {"Accept": "application/vnd.github+json"}
+    token = os.getenv("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    resp = httpx.get(url, headers=headers, params={"per_page": 100},
+                     timeout=30, follow_redirects=True)
+    if resp.status_code in (403, 404):
+        raise ReviewError(f"Could not list PR files (HTTP {resp.status_code}).")
+    resp.raise_for_status()
+
+    files: dict = {}
+    for item in resp.json():
+        path = item.get("filename", "")
+        if item.get("status") == "removed" or not path.endswith(".py"):
+            continue
+        added = added_line_numbers(item.get("patch", ""))
+        content = ""
+        raw_url = item.get("raw_url")
+        if raw_url:
+            c = httpx.get(raw_url, headers=headers, timeout=30, follow_redirects=True)
+            if c.status_code == 200:
+                content = c.text
+        files[path] = {"content": content, "added": added}
+    return files
+
+
+def _static_to_finding(s: dict) -> dict:
+    """Convert a raw static-tool finding into our standard finding shape, tagged
+    as deterministic so the rest of the pipeline treats it as ground truth."""
+    return {
+        "severity": s.get("severity", "medium"),
+        "category": s.get("category", "bug"),
+        "confidence": "high",
+        "file": s.get("file"),
+        "line": s.get("line"),
+        "evidence": "",
+        "title": f"{s.get('tool', '').upper()} {s.get('code', '')}".strip(),
+        "description": s.get("message", ""),
+        "suggestion": "",
+        "source": "static",
+    }
+
+
+def gather_static_findings(owner: str, repo: str, number: int) -> list:
+    """Run ruff + bandit on the PR's changed Python files and return findings
+    (in standard shape) for lines this PR actually added/changed."""
+    files = fetch_pr_files(owner, repo, number)
+    contents = {p: f["content"] for p, f in files.items()}
+    out = []
+    for r in analyze_files(contents):
+        added = files.get(r["file"], {}).get("added", set())
+        if r.get("line") in added:
+            out.append(_static_to_finding(r))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -152,12 +237,28 @@ Respond with ONLY valid JSON in exactly this shape:
 }"""
 
 
-def build_user_prompt(diff: str) -> str:
+def build_user_prompt(diff: str, static_findings: list | None = None) -> str:
     truncated = diff[:MAX_DIFF_CHARS]
     note = ""
     if len(diff) > MAX_DIFF_CHARS:
         note = "\n\n[NOTE: diff was truncated for length — review what is shown.]"
-    return f"Here is the pull request diff:\n\n```diff\n{truncated}\n```{note}"
+
+    static_block = ""
+    if static_findings:
+        rows = "\n".join(
+            f"- {s.get('file')}:{s.get('line')} [{s.get('title')}] {s.get('description')}"
+            for s in static_findings
+        )
+        # These are deterministic tool outputs. Telling the model they're already
+        # caught stops it from re-reporting them, and frames them as facts it can
+        # build on rather than second-guess.
+        static_block = (
+            "\n\nStatic-analysis tools (ruff, bandit) already flagged the issues "
+            "below. Treat them as ESTABLISHED FACTS — do NOT re-report them, and "
+            "do NOT contradict them. You may add deeper context the tools miss:\n"
+            f"{rows}"
+        )
+    return f"Here is the pull request diff:\n\n```diff\n{truncated}\n```{note}{static_block}"
 
 
 # ---------------------------------------------------------------------------
@@ -194,9 +295,9 @@ def _chat_json(system: str, user: str) -> dict:
         raise ReviewError(f"Model did not return valid JSON: {e}\n{raw}")
 
 
-def review_diff(diff: str) -> dict:
-    """First pass: the reviewer proposes findings."""
-    return _chat_json(SYSTEM_PROMPT, build_user_prompt(diff))
+def review_diff(diff: str, static_findings: list | None = None) -> dict:
+    """First pass: the reviewer proposes findings (grounded by static findings)."""
+    return _chat_json(SYSTEM_PROMPT, build_user_prompt(diff, static_findings))
 
 
 # ---------------------------------------------------------------------------
@@ -253,14 +354,15 @@ def select_candidates(review: dict) -> tuple[list[dict], int]:
     return candidates, len(all_findings) - len(candidates)
 
 
-def run_review(diff: str) -> dict:
-    """The full pipeline as one callable: review -> confidence filter -> verify.
+def run_review(diff: str, static_findings: list | None = None) -> dict:
+    """The full pipeline as one callable: static facts + LLM review -> verify.
 
     Returns a plain dict so ANY caller (CLI, web server, tests) can use it.
-    This is the seam that lets Phase 2 reuse everything we built in Phase 1:
-    "compute the result" is now separate from "display the result".
+    Static findings (ruff/bandit) are deterministic, so they skip the verifier
+    and are auto-confirmed; only the LLM's probabilistic findings get verified.
     """
-    review = review_diff(diff)
+    static_findings = static_findings or []
+    review = review_diff(diff, static_findings)
     candidates, suppressed = select_candidates(review)
 
     confirmed: list[dict] = []
@@ -275,10 +377,12 @@ def run_review(diff: str) -> dict:
 
     return {
         "summary": review.get("summary", ""),
-        "confirmed": confirmed,
+        # Tools first (ground truth), then the verified LLM findings.
+        "confirmed": static_findings + confirmed,
         "refuted": refuted,
         "suppressed": suppressed,
         "rejected": review.get("rejected", []),
+        "static_count": len(static_findings),
     }
 
 
@@ -320,10 +424,12 @@ def print_review(result: dict, pr_label: str) -> None:
             conf = f.get("confidence", "?")
             location = f"{f.get('file', '?')}\n:{f.get('line', '?')}"
             evidence = f.get("evidence", "")
-            body = f"[bold]{f.get('title', '')}[/bold]  [dim]({conf} confidence)[/dim]\n{f.get('description', '')}"
+            tag = " [magenta](static)[/magenta]" if f.get("source") == "static" else f"  [dim]({conf} confidence)[/dim]"
+            body = f"[bold]{f.get('title', '')}[/bold]{tag}\n{f.get('description', '')}"
             if evidence:
                 body += f"\n\n[dim]Evidence:[/dim] [italic]{evidence.strip()}[/italic]"
-            body += f"\n\n[dim]Fix:[/dim] {f.get('suggestion', '')}"
+            if f.get("suggestion"):
+                body += f"\n\n[dim]Fix:[/dim] {f.get('suggestion', '')}"
             table.add_row(f"[{color}]{sev}[/{color}]", f.get("category", ""), location, body)
 
         console.print(table)
@@ -373,8 +479,11 @@ def main() -> None:
         if not diff.strip():
             raise ReviewError("That PR has an empty diff — nothing to review.")
 
+        with console.status("Running static analysis (ruff, bandit)..."):
+            static_findings = gather_static_findings(owner, repo, number)
+
         with console.status(f"Reviewing + verifying with {MODEL}..."):
-            result = run_review(diff)
+            result = run_review(diff, static_findings)
     except ReviewError as e:
         sys.exit(f"Error: {e}")
 

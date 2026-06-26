@@ -19,8 +19,8 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 
-# Reuse everything we built in Phase 1 — this is the payoff of run_review().
-from pr_reviewer import fetch_diff, run_review
+# Reuse everything we built in earlier phases — this is the payoff of run_review().
+from pr_reviewer import fetch_diff, gather_static_findings, run_review
 
 load_dotenv()
 
@@ -106,7 +106,8 @@ def review_and_comment(owner: str, repo: str, number: int) -> None:
         diff = fetch_diff(owner, repo, number)
         if not diff.strip():
             return
-        result = run_review(diff)
+        static_findings = gather_static_findings(owner, repo, number)
+        result = run_review(diff, static_findings)
         comment = format_comment(result)
         post_comment(owner, repo, number, comment)
         print(f"[bot] Posted review on {owner}/{repo}#{number}")
@@ -128,17 +129,19 @@ def format_comment(result: dict) -> str:
         lines.append("✅ **No issues found that survived verification.**")
     else:
         for f in confirmed:
-            sev = f.get("severity", "low")
+            sev = (f.get("severity") or "low").lower()
             emoji = SEVERITY_EMOJI.get(sev, "⚪")
+            src = " · 🔧 _ruff/bandit_" if f.get("source") == "static" else ""
             lines.append(f"### {emoji} {f.get('title', 'Issue')} — `{sev}`")
             lines.append(
-                f"**`{f.get('file', '?')}`** line {f.get('line', '?')} · _{f.get('category', '')}_"
+                f"**`{f.get('file', '?')}`** line {f.get('line', '?')} · _{f.get('category', '')}_{src}"
             )
             lines.append("")
             lines.append(f.get("description", ""))
             if f.get("evidence"):
                 lines.append(f"\n```\n{f['evidence'].strip()}\n```")
-            lines.append(f"\n**Suggested fix:** {f.get('suggestion', '')}")
+            if f.get("suggestion"):
+                lines.append(f"\n**Suggested fix:** {f.get('suggestion')}")
             lines.append("")
 
     # Transparency footer: show what we filtered out so the dev trusts the bot.
