@@ -15,6 +15,8 @@ import json
 import os
 import re
 import sys
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 from dotenv import load_dotenv
@@ -172,12 +174,11 @@ def gather_static_findings(owner: str, repo: str, number: int) -> list:
 # ---------------------------------------------------------------------------
 # 2. Build the prompt
 # ---------------------------------------------------------------------------
-# The system prompt defines the reviewer's job AND the exact output shape.
+# The review rules + output schema are SHARED by every agent. Each specialist
+# agent (Phase 4) prepends its own narrow focus, then inherits these rules.
 # Forcing a strict JSON schema is what makes the output usable by code later
 # (posting comments, scoring, storing). "Vibes" text output is a dead end.
-SYSTEM_PROMPT = """You are a staff-level software engineer doing a high-signal code review on a pull request diff. Your reviews are trusted because every comment is concrete, correct, and worth the developer's time.
-
-## What to review
+_SHARED_REVIEW_RULES = """## What to review
 - Review ONLY lines the diff ADDS or MODIFIES (lines starting with `+`). Use surrounding context only to understand them.
 - NEVER comment on code you cannot see in the diff. If judging an issue would require code outside the diff (other files, the rest of a function, imports at the top of the file), DO NOT raise it — you'd be guessing.
 
@@ -235,6 +236,54 @@ Respond with ONLY valid JSON in exactly this shape:
     }
   ]
 }"""
+
+
+# The original generalist prompt — kept for single-pass use / testing.
+SYSTEM_PROMPT = (
+    "You are a staff-level software engineer doing a high-signal code review on "
+    "a pull request diff. Your reviews are trusted because every comment is "
+    "concrete, correct, and worth the developer's time.\n\n" + _SHARED_REVIEW_RULES
+)
+
+
+# Phase 4: each specialist gets a NARROW focus and ignores everything else.
+# A reviewer told to think about ONE dimension goes deeper than a generalist
+# spreading attention across five. They all inherit the shared rules + schema.
+SPECIALISTS = [
+    {"name": "security", "focus":
+        "Focus EXCLUSIVELY on SECURITY: injection (SQL/command/eval/exec), "
+        "secrets hardcoded in code, unsafe deserialization (pickle/yaml), SSRF, "
+        "path traversal, weak crypto, missing input validation/sanitization, "
+        "auth/authorization gaps. Ignore performance, style, and docs entirely."},
+    {"name": "performance", "focus":
+        "Focus EXCLUSIVELY on PERFORMANCE: N+1 queries, work inside loops that "
+        "could be hoisted, O(n^2) where O(n) is possible, blocking I/O on hot "
+        "paths, missing caching/pagination, loading large data fully into memory. "
+        "Ignore security, style, and docs entirely."},
+    {"name": "architecture", "focus":
+        "Focus EXCLUSIVELY on DESIGN & MAINTAINABILITY: SOLID violations, tight "
+        "coupling, leaky abstractions, duplicated logic, functions doing too "
+        "much, swallowed/poor error handling, names that obscure intent. Ignore "
+        "micro-style, performance, and docs entirely."},
+    {"name": "testing", "focus":
+        "Focus EXCLUSIVELY on CORRECTNESS & TESTABILITY: unhandled edge cases "
+        "(None/empty/zero/negative), off-by-one errors, boundary conditions, "
+        "incorrect error handling, and new logic that lacks tests. Ignore "
+        "security, style, and docs entirely."},
+    {"name": "docs", "focus":
+        "Focus EXCLUSIVELY on API CLARITY: missing or wrong docstrings on PUBLIC "
+        "functions/classes, missing type hints on public signatures, misleading "
+        "names. Only raise when it genuinely impairs USE of the API — never "
+        "nitpick. Ignore security, performance, and internal style entirely."},
+]
+
+
+def build_specialist_prompt(name: str, focus: str) -> str:
+    """Compose a specialist's system prompt: its narrow focus + the shared rules."""
+    return (
+        f"You are a staff-level {name} specialist doing a high-signal code review "
+        f"on a pull request diff. {focus}\n\n{_SHARED_REVIEW_RULES}"
+    )
 
 
 def build_user_prompt(diff: str, static_findings: list | None = None) -> str:
@@ -296,8 +345,96 @@ def _chat_json(system: str, user: str) -> dict:
 
 
 def review_diff(diff: str, static_findings: list | None = None) -> dict:
-    """First pass: the reviewer proposes findings (grounded by static findings)."""
+    """Single generalist pass (kept for testing / fallback)."""
     return _chat_json(SYSTEM_PROMPT, build_user_prompt(diff, static_findings))
+
+
+def _run_specialist(spec: dict, user_prompt: str) -> dict:
+    """Run one specialist agent. Tags each finding with its agent name.
+    Failures are isolated — one agent erroring must not sink the others."""
+    try:
+        result = _chat_json(build_specialist_prompt(spec["name"], spec["focus"]), user_prompt)
+    except ReviewError:
+        return {"findings": [], "rejected": []}
+    for f in result.get("findings", []):
+        f["agent"] = spec["name"]
+    return result
+
+
+def review_all_specialists(diff: str, static_findings: list | None = None) -> dict:
+    """Phase 4 orchestrator: fan out to all specialists IN PARALLEL, then merge
+    their findings. Wall-clock ≈ one LLM call, not five, because they run
+    concurrently in a thread pool (the Groq SDK calls are blocking I/O)."""
+    user_prompt = build_user_prompt(diff, static_findings)
+    with ThreadPoolExecutor(max_workers=len(SPECIALISTS)) as ex:
+        results = list(ex.map(lambda s: _run_specialist(s, user_prompt), SPECIALISTS))
+
+    findings: list[dict] = []
+    rejected: list[dict] = []
+    for r in results:
+        findings += r.get("findings", [])
+        rejected += r.get("rejected", [])
+    return {"findings": findings, "rejected": rejected}
+
+
+_SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+
+def _sev_rank(f: dict) -> int:
+    return _SEVERITY_ORDER.get(_norm(f.get("severity")), 9)
+
+
+def _line_int(line) -> str | None:
+    """Extract a line number from the model's free-form 'line' field, if any."""
+    m = re.search(r"\d+", str(line or ""))
+    return m.group() if m else None
+
+
+def dedup_findings(findings: list[dict]) -> list[dict]:
+    """Merge duplicate findings from different specialist agents.
+
+    Two findings are the same issue if they're in the same file AND share either
+    a normalized title or a (line number + category). We keep the most-severe
+    copy and record EVERY agent that flagged it — agreement across agents is a
+    useful confidence signal, not noise. Running this BEFORE verification also
+    saves redundant verifier calls.
+    """
+    kept: list[dict] = []
+    for f in findings:
+        title_key = _norm(f.get("title"))
+        line_key = _line_int(f.get("line"))
+        cat_key = _norm(f.get("category"))
+        dup = None
+        for k in kept:
+            if k.get("file") != f.get("file"):
+                continue
+            same_title = title_key and title_key == _norm(k.get("title"))
+            same_line = line_key and line_key == _line_int(k.get("line")) and cat_key == _norm(k.get("category"))
+            if same_title or same_line:
+                dup = k
+                break
+        if dup is None:
+            f["agents"] = sorted(set(filter(None, [f.get("agent")])))
+            kept.append(f)
+            continue
+        # Merge: union the agents, and upgrade to the more severe copy's fields.
+        agents = set(dup.get("agents", [])) | set(filter(None, [f.get("agent")]))
+        if _sev_rank(f) < _sev_rank(dup):
+            kept[kept.index(dup)] = f
+            f["agents"] = sorted(agents)
+        else:
+            dup["agents"] = sorted(agents)
+    return kept
+
+
+def _synthesize_summary(findings: list[dict]) -> str:
+    """Build a one-line summary from the final findings (deterministic — no
+    extra LLM call). Replaces the single generalist's prose summary."""
+    if not findings:
+        return "No issues found by the specialist agents. The change looks clean."
+    by_cat = Counter(_norm(f.get("category")) or "other" for f in findings)
+    parts = ", ".join(f"{n} {cat}" for cat, n in by_cat.most_common())
+    return f"Found {len(findings)} issue(s) across the review: {parts}."
 
 
 # ---------------------------------------------------------------------------
@@ -362,7 +499,10 @@ def run_review(diff: str, static_findings: list | None = None) -> dict:
     and are auto-confirmed; only the LLM's probabilistic findings get verified.
     """
     static_findings = static_findings or []
-    review = review_diff(diff, static_findings)
+    # Phase 4: fan out to parallel specialist agents instead of one generalist.
+    review = review_all_specialists(diff, static_findings)
+    # Specialists overlap — merge duplicates before paying to verify them.
+    review["findings"] = dedup_findings(review.get("findings", []))
     candidates, suppressed = select_candidates(review)
 
     confirmed: list[dict] = []
@@ -375,10 +515,11 @@ def run_review(diff: str, static_findings: list | None = None) -> dict:
         else:
             refuted.append(f)
 
+    all_confirmed = static_findings + confirmed
     return {
-        "summary": review.get("summary", ""),
+        "summary": _synthesize_summary(all_confirmed),
         # Tools first (ground truth), then the verified LLM findings.
-        "confirmed": static_findings + confirmed,
+        "confirmed": all_confirmed,
         "refuted": refuted,
         "suppressed": suppressed,
         "rejected": review.get("rejected", []),
@@ -424,7 +565,12 @@ def print_review(result: dict, pr_label: str) -> None:
             conf = f.get("confidence", "?")
             location = f"{f.get('file', '?')}\n:{f.get('line', '?')}"
             evidence = f.get("evidence", "")
-            tag = " [magenta](static)[/magenta]" if f.get("source") == "static" else f"  [dim]({conf} confidence)[/dim]"
+            if f.get("source") == "static":
+                tag = " [magenta](static)[/magenta]"
+            else:
+                agents = f.get("agents") or ([f["agent"]] if f.get("agent") else [])
+                who = f"[blue]@{','.join(agents)}[/blue] · " if agents else ""
+                tag = f"  [dim]({who}{conf} confidence)[/dim]"
             body = f"[bold]{f.get('title', '')}[/bold]{tag}\n{f.get('description', '')}"
             if evidence:
                 body += f"\n\n[dim]Evidence:[/dim] [italic]{evidence.strip()}[/italic]"

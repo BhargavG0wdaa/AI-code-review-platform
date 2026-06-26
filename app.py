@@ -131,7 +131,12 @@ def format_comment(result: dict) -> str:
         for f in confirmed:
             sev = (f.get("severity") or "low").lower()
             emoji = SEVERITY_EMOJI.get(sev, "⚪")
-            src = " · 🔧 _ruff/bandit_" if f.get("source") == "static" else ""
+            if f.get("source") == "static":
+                src = " · 🔧 _ruff/bandit_"
+            elif f.get("agents"):
+                src = f" · 🤖 _{', '.join(f['agents'])}_"
+            else:
+                src = ""
             lines.append(f"### {emoji} {f.get('title', 'Issue')} — `{sev}`")
             lines.append(
                 f"**`{f.get('file', '?')}`** line {f.get('line', '?')} · _{f.get('category', '')}_{src}"
