@@ -15,12 +15,13 @@ import json
 import os
 import re
 import sys
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 from dotenv import load_dotenv
-from groq import Groq
+from groq import Groq, RateLimitError
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -169,6 +170,60 @@ def gather_static_findings(owner: str, repo: str, number: int) -> list:
         if r.get("line") in added:
             out.append(_static_to_finding(r))
     return out
+
+
+def _gh_headers() -> dict:
+    headers = {"Accept": "application/vnd.github+json"}
+    token = os.getenv("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _fetch_pr_head_sha(owner: str, repo: str, number: int) -> str:
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}"
+    resp = httpx.get(url, headers=_gh_headers(), timeout=30, follow_redirects=True)
+    resp.raise_for_status()
+    return resp.json()["head"]["sha"]
+
+
+def fetch_repo_python_files(owner: str, repo: str, ref: str, max_files: int = 60) -> dict:
+    """Fetch the repo's Python files at a given commit, for indexing. Capped so a
+    huge repo doesn't explode (real systems index incrementally / cache)."""
+    url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{ref}"
+    resp = httpx.get(url, headers=_gh_headers(), params={"recursive": "1"},
+                     timeout=30, follow_redirects=True)
+    resp.raise_for_status()
+    blobs = [t for t in resp.json().get("tree", [])
+             if t.get("type") == "blob" and t.get("path", "").endswith(".py")]
+    files = {}
+    for t in blobs[:max_files]:
+        raw = f"https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{t['path']}"
+        c = httpx.get(raw, headers=_gh_headers(), timeout=30, follow_redirects=True)
+        if c.status_code == 200:
+            files[t["path"]] = c.text
+    return files
+
+
+def build_repo_context(owner: str, repo: str, number: int, diff: str, k: int = 5) -> str:
+    """Index the repo and retrieve the code most relevant to this diff (e.g. the
+    callers of changed functions). Best-effort: any failure (Qdrant down, etc.)
+    returns "" so a review is never blocked by the RAG layer."""
+    try:
+        from rag import RepoIndex  # local import: only load embeddings when used
+        head = _fetch_pr_head_sha(owner, repo, number)
+        files = fetch_repo_python_files(owner, repo, head)
+        if not files:
+            return ""
+        index = RepoIndex(f"repo_{owner}_{repo}".lower())
+        index.index(files)
+        hits = index.search(diff[:4000], k=k)
+        blocks = [f"# {h['path']} :: {h['name']} (line {h['start']})\n{h['code']}"
+                  for h in hits]
+        return "\n\n".join(blocks)
+    except Exception as e:
+        print(f"[rag] context retrieval skipped: {e}")
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -320,11 +375,24 @@ def plan_specialists(diff: str, static_findings: list | None = None) -> list:
     return chosen or [s["name"] for s in SPECIALISTS]  # never run zero agents
 
 
-def build_user_prompt(diff: str, static_findings: list | None = None) -> str:
+def build_user_prompt(diff: str, static_findings: list | None = None,
+                      repo_context: str | None = None) -> str:
     truncated = diff[:MAX_DIFF_CHARS]
     note = ""
     if len(diff) > MAX_DIFF_CHARS:
         note = "\n\n[NOTE: diff was truncated for length — review what is shown.]"
+
+    context_block = ""
+    if repo_context:
+        # Retrieved related code (e.g. callers of changed functions). It is NOT
+        # part of the PR — it's background so the reviewer/verifier can judge how
+        # the changed code is actually used.
+        context_block = (
+            "\n\nRELATED REPOSITORY CODE (retrieved for context — this is NOT part "
+            "of the PR, do not review it; use it to understand how the changed "
+            "code is used elsewhere):\n```python\n"
+            f"{repo_context[:2500]}\n```"
+        )
 
     static_block = ""
     if static_findings:
@@ -341,7 +409,7 @@ def build_user_prompt(diff: str, static_findings: list | None = None) -> str:
             "do NOT contradict them. You may add deeper context the tools miss:\n"
             f"{rows}"
         )
-    return f"Here is the pull request diff:\n\n```diff\n{truncated}\n```{note}{static_block}"
+    return f"Here is the pull request diff:\n\n```diff\n{truncated}\n```{note}{static_block}{context_block}"
 
 
 # ---------------------------------------------------------------------------
@@ -358,17 +426,27 @@ def get_client() -> Groq:
     return _client
 
 
-def _chat_json(system: str, user: str) -> dict:
-    """Send one system+user turn, force JSON back, parse it."""
-    response = get_client().chat.completions.create(
-        model=MODEL,
-        response_format={"type": "json_object"},
-        temperature=0.2,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-    )
+def _chat_json(system: str, user: str, max_retries: int = 5) -> dict:
+    """Send one system+user turn, force JSON back, parse it.
+    Retries with exponential backoff on rate limits (free tier = 12k tokens/min),
+    which is expected when several agents fire at once."""
+    response = None
+    for attempt in range(max_retries + 1):
+        try:
+            response = get_client().chat.completions.create(
+                model=MODEL,
+                response_format={"type": "json_object"},
+                temperature=0.2,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            )
+            break
+        except RateLimitError:
+            if attempt == max_retries:
+                raise ReviewError("Groq rate limit hit repeatedly — wait a minute or upgrade tier.")
+            time.sleep(min(2 ** attempt * 2, 30))  # 2, 4, 8, 16, 30s
     raw = response.choices[0].message.content
     if not raw:
         raise ReviewError("Model returned an empty response.")
@@ -396,14 +474,16 @@ def _run_specialist(spec: dict, user_prompt: str) -> dict:
 
 
 def review_all_specialists(diff: str, static_findings: list | None = None,
-                           only: list | None = None) -> dict:
+                           only: list | None = None, repo_context: str | None = None) -> dict:
     """Phase 4 orchestrator: fan out to the chosen specialists IN PARALLEL, then
     merge their findings. Wall-clock ≈ one LLM call, not N, because they run
     concurrently in a thread pool (the Groq SDK calls are blocking I/O).
     `only` restricts to a subset of specialist names (chosen by the planner)."""
     specs = [s for s in SPECIALISTS if only is None or s["name"] in only]
-    user_prompt = build_user_prompt(diff, static_findings)
-    with ThreadPoolExecutor(max_workers=max(1, len(specs))) as ex:
+    user_prompt = build_user_prompt(diff, static_findings, repo_context)
+    # Cap concurrency: too many simultaneous big prompts blow the per-minute
+    # token limit. 3 in flight + retry-with-backoff stays under the free tier.
+    with ThreadPoolExecutor(max_workers=min(3, max(1, len(specs)))) as ex:
         results = list(ex.map(lambda s: _run_specialist(s, user_prompt), specs))
 
     findings: list[dict] = []
@@ -490,7 +570,15 @@ You are given the full PR diff and one claimed finding. Trace the ACTUAL control
 - Do OTHER branches or lines in the diff already handle the case the finding worries about? (e.g. a later `elif` that catches the value.) If so, the finding is refuted.
 - Does confirming the finding require assuming behavior of code NOT shown in the diff? If so it is unproven — refuted.
 
-Be rigorous, not generous. A finding that "could be an issue" but isn't provably one is refuted. When in doubt, refute.
+## NON-EXCUSABLE findings — confirm these on sight
+The following high-severity security issues are CONFIRMED whenever the pattern appears in ADDED code. You must NOT refute them with excuses like "it's probably a test file", "the value looks fake / says do-not-use", "the real one is set elsewhere", or "it may not be called with untrusted input". Surrounding context can only RAISE your confidence here, never excuse it:
+- Hardcoded secrets, credentials, or API keys committed in source
+- eval()/exec() or shell/command execution on a variable
+- Unsafe deserialization (pickle.loads, yaml.load without SafeLoader)
+- SQL/queries built by string concatenation or f-strings
+If the finding is one of these and the pattern is really present in the diff, return "confirmed".
+
+Be rigorous, not generous. For everything else: a finding that "could be an issue" but isn't provably one is refuted. When in doubt, refute.
 
 Respond with ONLY valid JSON:
 {
@@ -499,16 +587,25 @@ Respond with ONLY valid JSON:
 }"""
 
 
-def verify_finding(diff: str, finding: dict) -> dict:
-    """Run one finding through the adversarial verifier. Returns {verdict, reasoning}."""
+def verify_finding(diff: str, finding: dict, repo_context: str | None = None) -> dict:
+    """Run one finding through the adversarial verifier. Returns {verdict, reasoning}.
+    With repo_context, the verifier can see how the changed code is used elsewhere
+    — so it can CONFIRM bugs it previously refused for lack of caller context."""
     claim = (
         f"Title: {finding.get('title')}\n"
         f"File: {finding.get('file')}  Line: {finding.get('line')}\n"
         f"Evidence line: {finding.get('evidence')}\n"
         f"Claimed problem: {finding.get('description')}"
     )
+    context_block = ""
+    if repo_context:
+        context_block = (
+            "\n\nRELATED REPOSITORY CODE (how the changed code is used elsewhere — "
+            "use this to judge the claim):\n```python\n"
+            f"{repo_context[:2500]}\n```"
+        )
     user = (
-        f"Full PR diff:\n```diff\n{diff[:MAX_DIFF_CHARS]}\n```\n\n"
+        f"Full PR diff:\n```diff\n{diff[:MAX_DIFF_CHARS]}\n```{context_block}\n\n"
         f"Claimed finding to disprove:\n{claim}"
     )
     return _chat_json(VERIFIER_SYSTEM_PROMPT, user)
@@ -528,18 +625,21 @@ def select_candidates(review: dict) -> tuple[list[dict], int]:
     return candidates, len(all_findings) - len(candidates)
 
 
-def run_review(diff: str, static_findings: list | None = None) -> dict:
+def run_review(diff: str, static_findings: list | None = None,
+               repo_context: str | None = None) -> dict:
     """The full pipeline as one callable: static facts + LLM review -> verify.
 
     Returns a plain dict so ANY caller (CLI, web server, tests) can use it.
     Static findings (ruff/bandit) are deterministic, so they skip the verifier
     and are auto-confirmed; only the LLM's probabilistic findings get verified.
+    repo_context (Phase 5) is retrieved related code passed to both the
+    specialists and the verifier so they can reason about cross-file usage.
     """
     static_findings = static_findings or []
     # Phase 4b: planner picks which specialists are worth running for this diff.
     planned = plan_specialists(diff, static_findings)
-    # Phase 4: fan out to the chosen specialist agents in parallel.
-    review = review_all_specialists(diff, static_findings, only=planned)
+    # Phase 4 + 5: fan out to the chosen specialists, grounded by retrieved repo context.
+    review = review_all_specialists(diff, static_findings, only=planned, repo_context=repo_context)
     # Specialists overlap — merge duplicates before paying to verify them.
     review["findings"] = dedup_findings(review.get("findings", []))
     candidates, suppressed = select_candidates(review)
@@ -547,7 +647,7 @@ def run_review(diff: str, static_findings: list | None = None) -> dict:
     confirmed: list[dict] = []
     refuted: list[dict] = []
     for f in candidates:
-        verdict = verify_finding(diff, f)
+        verdict = verify_finding(diff, f, repo_context=repo_context)
         f["_verdict"] = verdict
         if verdict.get("verdict") == "confirmed":
             confirmed.append(f)
@@ -677,8 +777,11 @@ def main() -> None:
         with console.status("Running static analysis (ruff, bandit)..."):
             static_findings = gather_static_findings(owner, repo, number)
 
+        with console.status("Indexing repo + retrieving context (RAG)..."):
+            repo_context = build_repo_context(owner, repo, number, diff)
+
         with console.status(f"Reviewing + verifying with {MODEL}..."):
-            result = run_review(diff, static_findings)
+            result = run_review(diff, static_findings, repo_context=repo_context)
     except ReviewError as e:
         sys.exit(f"Error: {e}")
 

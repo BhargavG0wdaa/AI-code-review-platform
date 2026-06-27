@@ -20,7 +20,12 @@ from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 
 # Reuse everything we built in earlier phases — this is the payoff of run_review().
-from pr_reviewer import fetch_diff, gather_static_findings, run_review
+from pr_reviewer import (
+    build_repo_context,
+    fetch_diff,
+    gather_static_findings,
+    run_review,
+)
 
 load_dotenv()
 
@@ -107,7 +112,8 @@ def review_and_comment(owner: str, repo: str, number: int) -> None:
         if not diff.strip():
             return
         static_findings = gather_static_findings(owner, repo, number)
-        result = run_review(diff, static_findings)
+        repo_context = build_repo_context(owner, repo, number, diff)
+        result = run_review(diff, static_findings, repo_context=repo_context)
         comment = format_comment(result)
         post_comment(owner, repo, number, comment)
         print(f"[bot] Posted review on {owner}/{repo}#{number}")
