@@ -210,6 +210,14 @@ Chart.defaults.font.family="-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,san
 Chart.defaults.color=THEME==='dark'?'#94a3b8':'#64748b';
 Chart.defaults.plugins.legend.labels.boxWidth=12;
 const g={scales:{x:{grid:{display:false}},y:{beginAtZero:true,grid:{color:GRID}}},plugins:{legend:{position:'bottom'}},maintainAspectRatio:false};
+function precColor(p){return p>=70?'var(--green)':p>=40?'var(--amber)':'var(--red)';}
+function latColor(s){return s<=30?'var(--green)':s>=60?'var(--red)':'var(--text)';}
+function fmtCost(c){return c<0.01?(c*100).toFixed(2)+'¢':'$'+c.toFixed(2);}
+const centerText={id:'ct',afterDraw(ch){const a=ch.chartArea;if(!a)return;const ctx=ch.ctx;
+  const total=ch.data.datasets[0].data.reduce((x,y)=>x+y,0);const x=(a.left+a.right)/2,y=(a.top+a.bottom)/2;
+  ctx.save();ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillStyle=Chart.defaults.color;
+  ctx.font='700 1.6rem -apple-system';ctx.fillText(total,x,y-8);
+  ctx.font='400 .72rem -apple-system';ctx.fillText('Total findings',x,y+13);ctx.restore();}};
 
 // repo filter options
 const repos=[...new Set(REVIEWS.map(r=>r.repo))];
@@ -235,7 +243,7 @@ function render(){
     {v:conf,l:'Findings confirmed',t:trend(sum(newer,'confirmed'),sum(older,'confirmed'),true)},
     {v:ref,l:'Findings refuted',t:''},
     {v:(judged?Math.round(ref/judged*100):0)+'%',l:'Refute rate',t:''},
-    {v:'$'+cost.toFixed(4),l:'Est. cost',t:trend(sum(newer,'cost'),sum(older,'cost'),false)},
+    {v:fmtCost(cost),l:'Est. cost',t:trend(sum(newer,'cost'),sum(older,'cost'),false)},
     {v:mean(R,'latency').toFixed(1)+'s',l:'Avg latency',t:trend(mean(newer,'latency'),mean(older,'latency'),false)},
   ];
   document.getElementById('kpis').innerHTML=kpis.map(k=>`<div class="kpi"><div class="v">${k.v}</div><div class="l">${k.l}</div>${k.t}</div>`).join('');
@@ -249,7 +257,7 @@ function render(){
     {label:'Refuted',data:R.map(r=>r.refuted),backgroundColor:C.slate,borderRadius:5}]},options:g});
   charts.o=new Chart(outcomes,{type:'doughnut',data:{labels:['Confirmed','Refuted','Suppressed'],
     datasets:[{data:[conf,ref,sum(R,'suppressed')],backgroundColor:[C.indigo,C.slate,C.amber],borderWidth:0}]},
-    options:{maintainAspectRatio:false,cutout:'62%',plugins:{legend:{position:'bottom'}}}});
+    options:{maintainAspectRatio:false,cutout:'68%',plugins:{legend:{position:'bottom'}}},plugins:[centerText]});
   const sev={critical:0,high:0,medium:0,low:0}; R.forEach(r=>Object.keys(sev).forEach(k=>sev[k]+=r.sev[k]||0));
   charts.s=new Chart(severity,{type:'bar',indexAxis:'y',data:{labels:['Critical','High','Medium','Low'],
     datasets:[{data:[sev.critical,sev.high,sev.medium,sev.low],backgroundColor:[C.red,C.amber,C.indigo,C.slate],borderRadius:5}]},
@@ -265,11 +273,11 @@ function render(){
     agg[a].findings++; agg[a][f.status==='confirmed'?'confirmed':'refuted']++; })));
   const arows=Object.entries(agg).map(([a,v])=>({a,...v,p:v.findings?Math.round(v.confirmed/v.findings*100):0}))
     .sort((x,y)=>y.findings-x.findings);
-  document.getElementById('agents').innerHTML=arows.length?`<table><thead><tr><th>Agent</th><th>Findings</th><th>Confirmed</th><th>Refuted</th><th>Precision</th></tr></thead><tbody>${arows.map(r=>`<tr><td>${agentName(r.a)}</td><td class="num">${r.findings}</td><td class="num">${r.confirmed}</td><td class="num">${r.refuted}</td><td class="num">${r.p}%</td></tr>`).join('')}</tbody></table>`:'<div class="empty">No agent data.</div>';
+  document.getElementById('agents').innerHTML=arows.length?`<table><thead><tr><th>Agent</th><th>Findings</th><th>Confirmed</th><th>Refuted</th><th>Precision</th></tr></thead><tbody>${arows.map(r=>`<tr><td>${agentName(r.a)}</td><td class="num">${r.findings}</td><td class="num">${r.confirmed}</td><td class="num">${r.refuted}</td><td class="num" style="color:${precColor(r.p)};font-weight:700">${r.p}%</td></tr>`).join('')}</tbody></table>`:'<div class="empty">No agent data.</div>';
 
   // recent table
   const rows=[...R].reverse().slice(0,25);
-  document.getElementById('table').innerHTML=rows.length?`<table><thead><tr><th>PR</th><th>Confirmed</th><th>Refuted</th><th>Latency</th><th>Cost</th></tr></thead><tbody>${rows.map(r=>`<tr class="clk" onclick="location.href='/review/${r.idx}'"><td>${r.pr}</td><td><span class="pill ok">🟢 ${r.confirmed}</span></td><td><span class="pill no">🔴 ${r.refuted}</span></td><td class="num">${r.latency}s</td><td class="num">$${r.cost.toFixed(4)}</td></tr>`).join('')}</tbody></table>`:'<div class="empty">No reviews match these filters.</div>';
+  document.getElementById('table').innerHTML=rows.length?`<table><thead><tr><th>PR</th><th>Confirmed</th><th>Refuted</th><th>Latency</th><th>Cost</th></tr></thead><tbody>${rows.map(r=>`<tr class="clk" onclick="location.href='/review/${r.idx}'"><td>${r.pr}</td><td><span class="pill ok">🟢 ${r.confirmed}</span></td><td><span class="pill no">🔴 ${r.refuted}</span></td><td class="num" style="color:${latColor(r.latency)};font-weight:600">${r.latency}s</td><td class="num">${fmtCost(r.cost)}</td></tr>`).join('')}</tbody></table>`:'<div class="empty">No reviews match these filters.</div>';
 }
 render();
 </script></body></html>"""
