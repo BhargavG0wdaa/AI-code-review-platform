@@ -18,14 +18,11 @@ import traceback
 import httpx
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
+from fastapi.responses import HTMLResponse
 
-# Reuse everything we built in earlier phases — this is the payoff of run_review().
-from pr_reviewer import (
-    build_repo_context,
-    fetch_diff,
-    gather_static_findings,
-    run_review,
-)
+# Reuse everything we built in earlier phases — this is the payoff of review_pr().
+from observability import compute_stats, load_traces
+from pr_reviewer import review_pr
 
 load_dotenv()
 
@@ -41,6 +38,58 @@ app = FastAPI(title="AI Code Review Bot")
 @app.get("/")
 def health() -> dict:
     return {"status": "ok", "service": "ai-code-review-bot"}
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: observability endpoints.
+# ---------------------------------------------------------------------------
+@app.get("/stats")
+def stats() -> dict:
+    """Aggregate metrics across all reviews (JSON)."""
+    return compute_stats(load_traces())
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard() -> str:
+    """A tiny self-contained HTML dashboard of recent reviews."""
+    traces = load_traces()
+    s = compute_stats(traces)
+    recent = list(reversed(traces[-25:]))  # newest first
+
+    if not traces:
+        return "<h2>🤖 AI Code Review — Dashboard</h2><p>No reviews recorded yet.</p>"
+
+    cards = "".join(
+        f"<div class='card'><div class='num'>{v}</div><div class='lbl'>{k.replace('_', ' ')}</div></div>"
+        for k, v in s.items()
+    )
+    rows = "".join(
+        f"<tr><td>{t.get('pr', '?')}</td>"
+        f"<td>{t.get('counts', {}).get('confirmed', 0)}</td>"
+        f"<td>{t.get('counts', {}).get('refuted', 0)}</td>"
+        f"<td>{', '.join(t.get('planned_agents', []))}</td>"
+        f"<td>{t.get('timings_ms', {}).get('total', 0)} ms</td>"
+        f"<td>{t.get('tokens', {}).get('total', 0)}</td></tr>"
+        for t in recent
+    )
+    return f"""
+    <html><head><title>AI Code Review Dashboard</title><style>
+      body{{font-family:system-ui,sans-serif;margin:2rem;background:#0d1117;color:#e6edf3}}
+      h2{{margin-bottom:1rem}}
+      .cards{{display:flex;flex-wrap:wrap;gap:1rem;margin-bottom:2rem}}
+      .card{{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:1rem 1.4rem;min-width:120px}}
+      .num{{font-size:1.8rem;font-weight:700;color:#58a6ff}}
+      .lbl{{font-size:.8rem;color:#8b949e;text-transform:capitalize}}
+      table{{width:100%;border-collapse:collapse}}
+      th,td{{text-align:left;padding:.5rem .6rem;border-bottom:1px solid #30363d;font-size:.9rem}}
+      th{{color:#8b949e}}
+    </style></head><body>
+      <h2>🤖 AI Code Review — Dashboard</h2>
+      <div class='cards'>{cards}</div>
+      <h3>Recent reviews</h3>
+      <table><tr><th>PR</th><th>Confirmed</th><th>Refuted</th><th>Agents</th><th>Latency</th><th>Tokens</th></tr>
+      {rows}</table>
+    </body></html>"""
 
 
 # ---------------------------------------------------------------------------
@@ -108,12 +157,7 @@ async def webhook(
 # ---------------------------------------------------------------------------
 def review_and_comment(owner: str, repo: str, number: int) -> None:
     try:
-        diff = fetch_diff(owner, repo, number)
-        if not diff.strip():
-            return
-        static_findings = gather_static_findings(owner, repo, number)
-        repo_context = build_repo_context(owner, repo, number, diff)
-        result = run_review(diff, static_findings, repo_context=repo_context)
+        result = review_pr(owner, repo, number)
         comment = format_comment(result)
         post_comment(owner, repo, number, comment)
         print(f"[bot] Posted review on {owner}/{repo}#{number}")

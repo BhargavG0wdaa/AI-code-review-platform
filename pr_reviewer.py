@@ -15,6 +15,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -26,6 +27,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from observability import record_trace
 from static_analysis import analyze_files
 
 load_dotenv()
@@ -426,6 +428,33 @@ def get_client() -> Groq:
     return _client
 
 
+# Phase 6: thread-safe token accounting. Specialists call the LLM from threads,
+# so every increment is locked. reset() is called per review (assumes one review
+# at a time per process — fine for our use).
+_token_lock = threading.Lock()
+_token_usage = {"prompt": 0, "completion": 0, "total": 0, "calls": 0}
+
+
+def reset_tokens() -> None:
+    with _token_lock:
+        _token_usage.update(prompt=0, completion=0, total=0, calls=0)
+
+
+def get_tokens() -> dict:
+    with _token_lock:
+        return dict(_token_usage)
+
+
+def _record_usage(usage) -> None:
+    if not usage:
+        return
+    with _token_lock:
+        _token_usage["prompt"] += getattr(usage, "prompt_tokens", 0) or 0
+        _token_usage["completion"] += getattr(usage, "completion_tokens", 0) or 0
+        _token_usage["total"] += getattr(usage, "total_tokens", 0) or 0
+        _token_usage["calls"] += 1
+
+
 def _chat_json(system: str, user: str, max_retries: int = 5) -> dict:
     """Send one system+user turn, force JSON back, parse it.
     Retries with exponential backoff on rate limits (free tier = 12k tokens/min),
@@ -447,6 +476,7 @@ def _chat_json(system: str, user: str, max_retries: int = 5) -> dict:
             if attempt == max_retries:
                 raise ReviewError("Groq rate limit hit repeatedly — wait a minute or upgrade tier.")
             time.sleep(min(2 ** attempt * 2, 30))  # 2, 4, 8, 16, 30s
+    _record_usage(getattr(response, "usage", None))
     raw = response.choices[0].message.content
     if not raw:
         raise ReviewError("Model returned an empty response.")
@@ -570,15 +600,7 @@ You are given the full PR diff and one claimed finding. Trace the ACTUAL control
 - Do OTHER branches or lines in the diff already handle the case the finding worries about? (e.g. a later `elif` that catches the value.) If so, the finding is refuted.
 - Does confirming the finding require assuming behavior of code NOT shown in the diff? If so it is unproven — refuted.
 
-## NON-EXCUSABLE findings — confirm these on sight
-The following high-severity security issues are CONFIRMED whenever the pattern appears in ADDED code. You must NOT refute them with excuses like "it's probably a test file", "the value looks fake / says do-not-use", "the real one is set elsewhere", or "it may not be called with untrusted input". Surrounding context can only RAISE your confidence here, never excuse it:
-- Hardcoded secrets, credentials, or API keys committed in source
-- eval()/exec() or shell/command execution on a variable
-- Unsafe deserialization (pickle.loads, yaml.load without SafeLoader)
-- SQL/queries built by string concatenation or f-strings
-If the finding is one of these and the pattern is really present in the diff, return "confirmed".
-
-Be rigorous, not generous. For everything else: a finding that "could be an issue" but isn't provably one is refuted. When in doubt, refute.
+Be rigorous, not generous. A finding that "could be an issue" but isn't provably one is refuted. When in doubt, refute.
 
 Respond with ONLY valid JSON:
 {
@@ -665,6 +687,53 @@ def run_review(diff: str, static_findings: list | None = None,
         "static_count": len(static_findings),
         "planned_agents": planned,
     }
+
+
+def review_pr(owner: str, repo: str, number: int) -> dict:
+    """Full pipeline for one PR, instrumented: fetch -> static -> RAG -> review,
+    timing each stage and writing a trace record. Both the CLI and the webhook
+    bot call this, so observability lives in exactly one place."""
+    pr_label = f"{owner}/{repo}#{number}"
+    reset_tokens()
+    t0 = time.perf_counter()
+
+    diff = fetch_diff(owner, repo, number)
+    if not diff.strip():
+        raise ReviewError("That PR has an empty diff — nothing to review.")
+    t_diff = time.perf_counter()
+
+    static_findings = gather_static_findings(owner, repo, number)
+    t_static = time.perf_counter()
+
+    repo_context = build_repo_context(owner, repo, number, diff)
+    t_rag = time.perf_counter()
+
+    result = run_review(diff, static_findings, repo_context=repo_context)
+    t_end = time.perf_counter()
+
+    def ms(a, b):
+        return round((b - a) * 1000)
+
+    result["trace"] = {
+        "pr": pr_label,
+        "planned_agents": result.get("planned_agents", []),
+        "counts": {
+            "confirmed": len(result.get("confirmed", [])),
+            "refuted": len(result.get("refuted", [])),
+            "suppressed": result.get("suppressed", 0),
+            "static": result.get("static_count", 0),
+        },
+        "timings_ms": {
+            "diff": ms(t0, t_diff),
+            "static": ms(t_diff, t_static),
+            "rag": ms(t_static, t_rag),
+            "review": ms(t_rag, t_end),
+            "total": ms(t0, t_end),
+        },
+        "tokens": get_tokens(),
+    }
+    record_trace(result["trace"])
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -768,24 +837,18 @@ def main() -> None:
     try:
         owner, repo, number = parse_pr_url(args.pr_url)
         pr_label = f"{owner}/{repo}#{number}"
-
-        with console.status(f"Fetching diff for {pr_label}..."):
-            diff = fetch_diff(owner, repo, number)
-        if not diff.strip():
-            raise ReviewError("That PR has an empty diff — nothing to review.")
-
-        with console.status("Running static analysis (ruff, bandit)..."):
-            static_findings = gather_static_findings(owner, repo, number)
-
-        with console.status("Indexing repo + retrieving context (RAG)..."):
-            repo_context = build_repo_context(owner, repo, number, diff)
-
-        with console.status(f"Reviewing + verifying with {MODEL}..."):
-            result = run_review(diff, static_findings, repo_context=repo_context)
+        with console.status(f"Reviewing {pr_label} (static + RAG + agents)..."):
+            result = review_pr(owner, repo, number)
     except ReviewError as e:
         sys.exit(f"Error: {e}")
 
     print_review(result, pr_label)
+    t = result.get("trace", {})
+    console.print(
+        f"[dim]⏱  {t.get('timings_ms', {}).get('total', 0)}ms · "
+        f"{t.get('tokens', {}).get('total', 0)} tokens · "
+        f"{t.get('tokens', {}).get('calls', 0)} LLM calls[/dim]"
+    )
 
 
 if __name__ == "__main__":
