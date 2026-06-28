@@ -37,6 +37,11 @@ console = Console()
 # INFERENCE" box in your diagram.
 MODEL = "llama-3.3-70b-versatile"
 
+# Approx Groq pricing for the model above (USD per 1M tokens) — used to
+# estimate per-review cost from token usage.
+COST_PER_1M_INPUT = 0.59
+COST_PER_1M_OUTPUT = 0.79
+
 # We cap the diff we send to the model. Huge PRs would blow the context
 # window and cost. Real systems chunk per-file; for Phase 1 we just truncate
 # and tell the user. (We'll do proper chunking in a later phase.)
@@ -689,6 +694,37 @@ def run_review(diff: str, static_findings: list | None = None,
     }
 
 
+def _finding_record(f: dict, status: str, reason: str = "") -> dict:
+    """Flatten a finding into a self-contained record for the trace, so the
+    dashboard's detail page can render it without re-running anything."""
+    agents = f.get("agents") or ([f["agent"]] if f.get("agent") else [])
+    if not agents and f.get("source") == "static":
+        agents = ["tools"]
+    return {
+        "status": status,
+        "agents": agents or ["?"],
+        "severity": (f.get("severity") or "low").lower(),
+        "category": f.get("category", ""),
+        "confidence": "tool" if f.get("source") == "static" else f.get("confidence", ""),
+        "file": f.get("file"),
+        "line": f.get("line"),
+        "title": f.get("title", ""),
+        "description": f.get("description", ""),
+        "evidence": f.get("evidence", ""),
+        "suggestion": f.get("suggestion", ""),
+        "reason": reason,
+        "source": f.get("source", ""),
+    }
+
+
+def _estimate_cost(tokens: dict) -> float:
+    return round(
+        tokens.get("prompt", 0) / 1e6 * COST_PER_1M_INPUT
+        + tokens.get("completion", 0) / 1e6 * COST_PER_1M_OUTPUT,
+        4,
+    )
+
+
 def review_pr(owner: str, repo: str, number: int) -> dict:
     """Full pipeline for one PR, instrumented: fetch -> static -> RAG -> review,
     timing each stage and writing a trace record. Both the CLI and the webhook
@@ -714,6 +750,13 @@ def review_pr(owner: str, repo: str, number: int) -> dict:
     def ms(a, b):
         return round((b - a) * 1000)
 
+    tokens = get_tokens()
+    findings = [_finding_record(f, "confirmed") for f in result.get("confirmed", [])]
+    findings += [
+        _finding_record(f, "refuted", f.get("_verdict", {}).get("reasoning", ""))
+        for f in result.get("refuted", [])
+    ]
+
     result["trace"] = {
         "pr": pr_label,
         "planned_agents": result.get("planned_agents", []),
@@ -730,7 +773,9 @@ def review_pr(owner: str, repo: str, number: int) -> dict:
             "review": ms(t_rag, t_end),
             "total": ms(t0, t_end),
         },
-        "tokens": get_tokens(),
+        "tokens": tokens,
+        "cost_usd": _estimate_cost(tokens),
+        "findings": findings,
     }
     record_trace(result["trace"])
     return result

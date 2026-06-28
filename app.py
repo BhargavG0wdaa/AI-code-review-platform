@@ -22,7 +22,13 @@ from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
 # Reuse everything we built in earlier phases — this is the payoff of review_pr().
-from observability import compute_stats, load_traces
+from observability import (
+    agent_performance,
+    compute_stats,
+    get_trace,
+    load_traces,
+    severity_distribution,
+)
 from pr_reviewer import review_pr
 
 load_dotenv()
@@ -52,22 +58,33 @@ def stats() -> dict:
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard() -> str:
-    """Professional light-theme dashboard with charts (Chart.js via CDN)."""
+    """Professional dashboard (light/dark) with charts, agent scorecard, cost."""
     traces = load_traces()
     s = compute_stats(traces)
 
     def c(t, key):
         return t.get("counts", {}).get(key, 0)
 
-    # Chronological series for the charts.
     labels = [t.get("pr", "?").split("/")[-1] for t in traces]
+    indexed = list(enumerate(traces))
+    rows = [{
+        "idx": i,
+        "pr": t.get("pr", "?"),
+        "confirmed": c(t, "confirmed"),
+        "refuted": c(t, "refuted"),
+        "agents": ", ".join(t.get("planned_agents", [])),
+        "latency": t.get("timings_ms", {}).get("total", 0),
+        "tokens": t.get("tokens", {}).get("total", 0),
+        "cost": t.get("cost_usd", 0),
+    } for i, t in reversed(indexed[-25:])]
+
     data = {
         "kpis": [
             {"label": "Reviews", "value": s.get("reviews", 0)},
             {"label": "Findings confirmed", "value": s.get("total_confirmed", 0)},
             {"label": "Findings refuted", "value": s.get("total_refuted", 0)},
             {"label": "Refute rate", "value": f"{round(s.get('refute_rate', 0) * 100)}%"},
-            {"label": "Avg tokens / review", "value": f"{s.get('avg_tokens_per_review', 0):,}"},
+            {"label": "Est. cost", "value": f"${s.get('total_cost_usd', 0):.4f}"},
             {"label": "Avg latency", "value": f"{s.get('avg_latency_ms', 0) / 1000:.1f}s"},
         ],
         "labels": labels,
@@ -80,111 +97,178 @@ def dashboard() -> str:
         },
         "latency": [round(t.get("timings_ms", {}).get("total", 0) / 1000, 1) for t in traces],
         "tokens": [t.get("tokens", {}).get("total", 0) for t in traces],
-        "rows": [
-            {
-                "pr": t.get("pr", "?"),
-                "confirmed": c(t, "confirmed"),
-                "refuted": c(t, "refuted"),
-                "agents": ", ".join(t.get("planned_agents", [])),
-                "latency": t.get("timings_ms", {}).get("total", 0),
-                "tokens": t.get("tokens", {}).get("total", 0),
-            }
-            for t in reversed(traces[-25:])
-        ],
+        "severity": severity_distribution(traces),
+        "agents": agent_performance(traces),
+        "rows": rows,
     }
-    return _DASHBOARD_TEMPLATE.replace("__DATA__", json.dumps(data))
+    return (_DASHBOARD_TEMPLATE
+            .replace("__CSS__", _BASE_CSS)
+            .replace("__THEMEHEAD__", _THEME_HEAD)
+            .replace("__THEMEJS__", _THEME_JS)
+            .replace("__DATA__", json.dumps(data)))
 
 
-_DASHBOARD_TEMPLATE = """<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AI Code Review — Dashboard</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
-<style>
-  :root{
-    --bg:#f5f7fa; --card:#ffffff; --border:#e6e8ec; --text:#0f172a; --muted:#64748b;
-    --indigo:#6366f1; --green:#10b981; --amber:#f59e0b; --slate:#94a3b8;
-    --shadow:0 1px 3px rgba(15,23,42,.06),0 1px 2px rgba(15,23,42,.04);
-  }
+@app.get("/review/{idx}", response_class=HTMLResponse)
+def review_detail(idx: int) -> str:
+    """Per-review detail: timeline + every finding with status, reason, fix."""
+    t = get_trace(idx)
+    if not t:
+        return "<p style='font-family:sans-serif;padding:2rem'>Review not found.</p>"
+    return (_DETAIL_TEMPLATE
+            .replace("__CSS__", _BASE_CSS)
+            .replace("__THEMEHEAD__", _THEME_HEAD)
+            .replace("__THEMEJS__", _THEME_JS)
+            .replace("__DATA__", json.dumps(t)))
+
+
+_BASE_CSS = """
+  :root{--bg:#f5f7fa;--card:#fff;--border:#e6e8ec;--text:#0f172a;--muted:#64748b;
+        --grid:#eef1f5;--indigo:#6366f1;--green:#10b981;--amber:#f59e0b;--red:#ef4444;--slate:#94a3b8;
+        --shadow:0 1px 3px rgba(15,23,42,.06),0 1px 2px rgba(15,23,42,.04)}
+  [data-theme="dark"]{--bg:#0b1220;--card:#161e2e;--border:#27324a;--text:#e5e9f0;--muted:#94a3b8;
+        --grid:#1f2a3d;--shadow:0 1px 3px rgba(0,0,0,.4)}
   *{box-sizing:border-box}
-  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-       margin:0;background:var(--bg);color:var(--text);padding:2.5rem 2rem 4rem}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0;
+       background:var(--bg);color:var(--text);padding:2.5rem 2rem 4rem;transition:background .2s,color .2s}
   .wrap{max-width:1100px;margin:0 auto}
+  a{color:var(--indigo);text-decoration:none}
   header{display:flex;align-items:center;gap:.6rem;margin-bottom:.25rem}
   header h1{font-size:1.5rem;font-weight:700;margin:0}
+  .spacer{flex:1}
+  .toggle{background:var(--card);border:1px solid var(--border);border-radius:8px;color:var(--text);
+          padding:.45rem .7rem;cursor:pointer;font-size:.85rem}
   .sub{color:var(--muted);font-size:.9rem;margin-bottom:2rem}
   .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1rem;margin-bottom:2rem}
   .kpi{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:1.1rem 1.3rem;box-shadow:var(--shadow)}
-  .kpi .v{font-size:1.7rem;font-weight:750;letter-spacing:-.02em}
+  .kpi .v{font-size:1.6rem;font-weight:750;letter-spacing:-.02em}
   .kpi .l{font-size:.8rem;color:var(--muted);margin-top:.2rem}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:1.25rem;margin-bottom:2rem}
-  .panel{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:1.25rem 1.4rem;box-shadow:var(--shadow)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:1.25rem;margin-bottom:1.25rem}
+  .panel{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:1.25rem 1.4rem;box-shadow:var(--shadow);margin-bottom:1.25rem}
   .panel h3{margin:0 0 1rem;font-size:.95rem;font-weight:650}
   .chart-box{position:relative;height:240px}
   table{width:100%;border-collapse:collapse;font-size:.88rem}
   th,td{text-align:left;padding:.6rem .7rem;border-bottom:1px solid var(--border)}
-  th{color:var(--muted);font-weight:600;font-size:.78rem;text-transform:uppercase;letter-spacing:.03em}
+  th{color:var(--muted);font-weight:600;font-size:.76rem;text-transform:uppercase;letter-spacing:.03em}
   td.num{font-variant-numeric:tabular-nums}
+  tr.clk{cursor:pointer}
+  tr.clk:hover{background:var(--grid)}
   .empty{color:var(--muted);padding:3rem;text-align:center}
-</style></head>
-<body><div class="wrap">
-  <header><span style="font-size:1.6rem">🤖</span><h1>AI Code Review</h1></header>
+  .badge{display:inline-block;padding:.15rem .5rem;border-radius:999px;font-size:.72rem;font-weight:650;color:#fff}
+  .chip{display:inline-block;background:var(--grid);color:var(--muted);border-radius:8px;padding:.3rem .6rem;font-size:.8rem;margin-right:.5rem}
+  .bar{height:7px;border-radius:99px;background:var(--grid);overflow:hidden;margin-top:.3rem}
+  .bar>span{display:block;height:100%;background:var(--indigo)}
+  .timeline{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center}
+  .stage{background:var(--grid);border-radius:10px;padding:.5rem .8rem;font-size:.82rem}
+  .stage b{display:block;font-size:.95rem;font-variant-numeric:tabular-nums}
+  .arrow{color:var(--muted)}
+  .finding{border:1px solid var(--border);border-radius:12px;padding:1rem 1.1rem;margin-bottom:.9rem}
+  .finding h4{margin:.1rem 0 .4rem;font-size:1rem}
+  .finding .meta{font-size:.8rem;color:var(--muted);margin-bottom:.5rem}
+  pre{background:var(--grid);border-radius:8px;padding:.6rem .8rem;overflow:auto;font-size:.82rem;margin:.5rem 0}
+  .agent-h{font-size:.9rem;font-weight:700;margin:1.4rem 0 .6rem;text-transform:capitalize}
+"""
+
+_THEME_HEAD = """<script>(function(){var t=localStorage.getItem('theme')||'light';
+document.documentElement.setAttribute('data-theme',t);})();</script>"""
+
+_THEME_JS = """
+function toggleTheme(){var c=document.documentElement.getAttribute('data-theme');
+localStorage.setItem('theme',c==='dark'?'light':'dark');location.reload();}
+var THEME=document.documentElement.getAttribute('data-theme');
+"""
+
+_DASHBOARD_TEMPLATE = """<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Code Review — Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+__THEMEHEAD__
+<style>__CSS__</style></head><body><div class="wrap">
+  <header><span style="font-size:1.6rem">🤖</span><h1>AI Code Review</h1>
+    <span class="spacer"></span>
+    <button class="toggle" onclick="toggleTheme()">☀️ / 🌙</button></header>
   <div class="sub">Observability dashboard · static analysis · specialist agents · adversarial verifier</div>
   <div class="kpis" id="kpis"></div>
   <div class="grid">
     <div class="panel"><h3>Findings per review</h3><div class="chart-box"><canvas id="findings"></canvas></div></div>
     <div class="panel"><h3>Verifier outcomes (overall)</h3><div class="chart-box"><canvas id="outcomes"></canvas></div></div>
+    <div class="panel"><h3>Severity distribution (confirmed)</h3><div class="chart-box"><canvas id="severity"></canvas></div></div>
     <div class="panel"><h3>Latency per review (seconds)</h3><div class="chart-box"><canvas id="latency"></canvas></div></div>
-    <div class="panel"><h3>Tokens per review</h3><div class="chart-box"><canvas id="tokens"></canvas></div></div>
   </div>
-  <div class="panel"><h3>Recent reviews</h3><div id="table"></div></div>
+  <div class="panel"><h3>Agent performance</h3><div id="agents"></div></div>
+  <div class="panel"><h3>Recent reviews <span style="font-weight:400;color:var(--muted);font-size:.8rem">— click a row for details</span></h3><div id="table"></div></div>
 </div>
 <script>
 const D = __DATA__;
-const C = {indigo:'#6366f1', green:'#10b981', amber:'#f59e0b', slate:'#94a3b8', muted:'#64748b'};
-Chart.defaults.font.family = "-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif";
-Chart.defaults.color = C.muted;
-Chart.defaults.plugins.legend.labels.boxWidth = 12;
+__THEMEJS__
+const C={indigo:'#6366f1',green:'#10b981',amber:'#f59e0b',red:'#ef4444',slate:'#94a3b8'};
+const GRID=THEME==='dark'?'#1f2a3d':'#eef1f5';
+Chart.defaults.font.family="-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif";
+Chart.defaults.color=THEME==='dark'?'#94a3b8':'#64748b';
+Chart.defaults.plugins.legend.labels.boxWidth=12;
+document.getElementById('kpis').innerHTML=D.kpis.map(k=>`<div class="kpi"><div class="v">${k.value}</div><div class="l">${k.label}</div></div>`).join('');
+const g={scales:{x:{grid:{display:false}},y:{beginAtZero:true,grid:{color:GRID}}},plugins:{legend:{position:'bottom'}},maintainAspectRatio:false};
+if(D.labels.length){
+  new Chart(findings,{type:'bar',data:{labels:D.labels,datasets:[{label:'Confirmed',data:D.confirmed,backgroundColor:C.indigo,borderRadius:5},{label:'Refuted',data:D.refuted,backgroundColor:C.slate,borderRadius:5}]},options:g});
+  new Chart(outcomes,{type:'doughnut',data:{labels:['Confirmed','Refuted','Suppressed'],datasets:[{data:[D.totals.confirmed,D.totals.refuted,D.totals.suppressed],backgroundColor:[C.indigo,C.slate,C.amber],borderWidth:0}]},options:{maintainAspectRatio:false,cutout:'62%',plugins:{legend:{position:'bottom'}}}});
+  new Chart(severity,{type:'bar',indexAxis:'y',data:{labels:['Critical','High','Medium','Low'],datasets:[{data:[D.severity.critical,D.severity.high,D.severity.medium,D.severity.low],backgroundColor:[C.red,C.amber,C.indigo,C.slate],borderRadius:5}]},options:{...g,plugins:{legend:{display:false}}}});
+  new Chart(latency,{type:'line',data:{labels:D.labels,datasets:[{label:'Latency (s)',data:D.latency,borderColor:C.green,backgroundColor:'rgba(16,185,129,.12)',fill:true,tension:.35,pointRadius:3}]},options:{...g,plugins:{legend:{display:false}}}});
+}else{document.querySelector('.grid').innerHTML='<div class="empty">No reviews recorded yet.</div>';}
+document.getElementById('agents').innerHTML=D.agents.length?`<table><thead><tr><th>Agent</th><th>Findings</th><th>Confirmed</th><th>Refuted</th><th>Precision</th></tr></thead><tbody>${D.agents.map(a=>`<tr><td style="text-transform:capitalize">${a.agent}</td><td class="num">${a.findings}</td><td class="num">${a.confirmed}</td><td class="num">${a.refuted}</td><td class="num">${a.precision}%</td></tr>`).join('')}</tbody></table>`:'<div class="empty">No agent data yet.</div>';
+document.getElementById('table').innerHTML=D.rows.length?`<table><thead><tr><th>PR</th><th>Confirmed</th><th>Refuted</th><th>Agents</th><th>Latency</th><th>Cost</th></tr></thead><tbody>${D.rows.map(r=>`<tr class="clk" onclick="location.href='/review/${r.idx}'"><td>${r.pr}</td><td class="num">${r.confirmed}</td><td class="num">${r.refuted}</td><td>${r.agents}</td><td class="num">${r.latency} ms</td><td class="num">$${r.cost.toFixed(4)}</td></tr>`).join('')}</tbody></table>`:'<div class="empty">No reviews yet.</div>';
+</script></body></html>"""
 
-// KPI cards
-document.getElementById('kpis').innerHTML = D.kpis.map(k =>
-  `<div class="kpi"><div class="v">${k.value}</div><div class="l">${k.label}</div></div>`).join('');
+_DETAIL_TEMPLATE = """<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Review detail</title>__THEMEHEAD__<style>__CSS__</style></head><body><div class="wrap">
+  <header><span style="font-size:1.4rem">🤖</span><h1 id="title">Review</h1>
+    <span class="spacer"></span>
+    <a href="/dashboard" class="toggle">← Dashboard</a>
+    <button class="toggle" onclick="toggleTheme()" style="margin-left:.5rem">☀️ / 🌙</button></header>
+  <div class="sub" id="meta"></div>
+  <div class="panel"><h3>Pipeline timeline</h3><div class="timeline" id="timeline"></div></div>
+  <div id="findings"></div>
+</div>
+<script>
+const T = __DATA__;
+__THEMEJS__
+document.getElementById('title').textContent=T.pr||'Review';
+const tk=T.tokens||{},tm=T.timings_ms||{};
+document.getElementById('meta').innerHTML=
+  `<span class="chip">💲 $${(T.cost_usd||0).toFixed(4)}</span>`+
+  `<span class="chip">🔢 ${(tk.total||0).toLocaleString()} tokens</span>`+
+  `<span class="chip">⏱ ${tm.total||0} ms</span>`+
+  `<span class="chip">🤖 ${(T.planned_agents||[]).join(', ')}</span>`;
+const stages=[['Diff',tm.diff],['Static',tm.static],['RAG',tm.rag],['Agents+Verify',tm.review]];
+document.getElementById('timeline').innerHTML=stages.map((s,i)=>
+  `<div class="stage">${s[0]}<b>${s[1]||0} ms</b></div>`+(i<stages.length-1?'<span class="arrow">→</span>':'')).join('');
+const SEV={critical:'#ef4444',high:'#f59e0b',medium:'#6366f1',low:'#94a3b8'};
+const CONF={high:95,medium:70,low:40,tool:100};
+const byAgent={};
+(T.findings||[]).forEach(f=>(f.agents||['?']).forEach(a=>{(byAgent[a]=byAgent[a]||[]).push(f);}));
+let html='';
+if(!(T.findings||[]).length){html='<div class="panel empty">No findings recorded for this review.</div>';}
+Object.keys(byAgent).forEach(agent=>{
+  html+=`<div class="agent-h">${agent} agent</div><div class="panel">`;
+  byAgent[agent].forEach(f=>{
+    const ok=f.status==='confirmed';
+    const conf=CONF[f.confidence]!==undefined?CONF[f.confidence]:60;
+    html+=`<div class="finding">
+      <span class="badge" style="background:${ok?'#10b981':'#94a3b8'}">${ok?'✓ Confirmed':'✗ Refuted'}</span>
+      <span class="badge" style="background:${SEV[f.severity]||'#94a3b8'}">${f.severity}</span>
+      <h4>${f.title||'Finding'}</h4>
+      <div class="meta">${f.file||'?'} : ${f.line||'?'} · ${f.category||''} · confidence: ${f.confidence||'n/a'}</div>
+      <div class="bar"><span style="width:${conf}%"></span></div>
+      <p>${f.description||''}</p>
+      ${f.reason?`<p><b>Verifier reasoning:</b> ${f.reason}</p>`:''}
+      ${f.evidence?`<pre>${f.evidence.replace(/</g,'&lt;')}</pre>`:''}
+      ${f.suggestion?`<p><b>Suggested fix:</b> ${f.suggestion.replace(/</g,'&lt;')}</p>`:''}
+    </div>`;
+  });
+  html+='</div>';
+});
+document.getElementById('findings').innerHTML=html;
+</script></body></html>"""
 
-if (!D.labels.length) {
-  document.querySelector('.grid').innerHTML = '<div class="empty">No reviews recorded yet — run a review to populate the dashboard.</div>';
-} else {
-  const grid = {scales:{x:{grid:{display:false}},y:{beginAtZero:true,grid:{color:'#eef1f5'}}},
-                plugins:{legend:{position:'bottom'}},maintainAspectRatio:false};
-
-  new Chart(findings, {type:'bar', data:{labels:D.labels, datasets:[
-    {label:'Confirmed', data:D.confirmed, backgroundColor:C.indigo, borderRadius:5},
-    {label:'Refuted', data:D.refuted, backgroundColor:C.slate, borderRadius:5}]},
-    options:grid});
-
-  new Chart(outcomes, {type:'doughnut', data:{labels:['Confirmed','Refuted','Suppressed'],
-    datasets:[{data:[D.totals.confirmed,D.totals.refuted,D.totals.suppressed],
-    backgroundColor:[C.indigo,C.slate,C.amber],borderWidth:0}]},
-    options:{maintainAspectRatio:false,cutout:'62%',plugins:{legend:{position:'bottom'}}}});
-
-  new Chart(latency, {type:'line', data:{labels:D.labels, datasets:[
-    {label:'Latency (s)', data:D.latency, borderColor:C.green, backgroundColor:'rgba(16,185,129,.12)',
-     fill:true, tension:.35, pointRadius:3}]},
-    options:{...grid, plugins:{legend:{display:false}}}});
-
-  new Chart(tokens, {type:'bar', data:{labels:D.labels, datasets:[
-    {label:'Tokens', data:D.tokens, backgroundColor:C.indigo, borderRadius:5}]},
-    options:{...grid, plugins:{legend:{display:false}}}});
-}
-
-// Recent reviews table
-document.getElementById('table').innerHTML = D.rows.length ?
-  `<table><thead><tr><th>PR</th><th>Confirmed</th><th>Refuted</th><th>Agents</th><th>Latency</th><th>Tokens</th></tr></thead>
-   <tbody>${D.rows.map(r => `<tr><td>${r.pr}</td><td class="num">${r.confirmed}</td>
-   <td class="num">${r.refuted}</td><td>${r.agents}</td><td class="num">${r.latency} ms</td>
-   <td class="num">${r.tokens.toLocaleString()}</td></tr>`).join('')}</tbody></table>`
-  : '<div class="empty">No reviews yet.</div>';
-</script>
-</body></html>"""
 
 
 # ---------------------------------------------------------------------------
