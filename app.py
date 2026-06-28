@@ -58,54 +58,42 @@ def stats() -> dict:
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard() -> str:
-    """Professional dashboard (light/dark) with charts, agent scorecard, cost."""
+    """Data-driven dashboard: filters, trends, daily analytics (light/dark)."""
     traces = load_traces()
-    s = compute_stats(traces)
 
     def c(t, key):
         return t.get("counts", {}).get(key, 0)
 
-    labels = [t.get("pr", "?").split("/")[-1] for t in traces]
-    indexed = list(enumerate(traces))
-    rows = [{
-        "idx": i,
-        "pr": t.get("pr", "?"),
-        "confirmed": c(t, "confirmed"),
-        "refuted": c(t, "refuted"),
-        "agents": ", ".join(t.get("planned_agents", [])),
-        "latency": t.get("timings_ms", {}).get("total", 0),
-        "tokens": t.get("tokens", {}).get("total", 0),
-        "cost": t.get("cost_usd", 0),
-    } for i, t in reversed(indexed[-25:])]
+    def sev_counts(t):
+        out = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+        for f in t.get("findings", []):
+            if f.get("status") == "confirmed":
+                out[f.get("severity", "low")] = out.get(f.get("severity", "low"), 0) + 1
+        return out
 
-    data = {
-        "kpis": [
-            {"label": "Reviews", "value": s.get("reviews", 0)},
-            {"label": "Findings confirmed", "value": s.get("total_confirmed", 0)},
-            {"label": "Findings refuted", "value": s.get("total_refuted", 0)},
-            {"label": "Refute rate", "value": f"{round(s.get('refute_rate', 0) * 100)}%"},
-            {"label": "Est. cost", "value": f"${s.get('total_cost_usd', 0):.4f}"},
-            {"label": "Avg latency", "value": f"{s.get('avg_latency_ms', 0) / 1000:.1f}s"},
-        ],
-        "labels": labels,
-        "confirmed": [c(t, "confirmed") for t in traces],
-        "refuted": [c(t, "refuted") for t in traces],
-        "totals": {
-            "confirmed": s.get("total_confirmed", 0),
-            "refuted": s.get("total_refuted", 0),
-            "suppressed": sum(c(t, "suppressed") for t in traces),
-        },
-        "latency": [round(t.get("timings_ms", {}).get("total", 0) / 1000, 1) for t in traces],
-        "tokens": [t.get("tokens", {}).get("total", 0) for t in traces],
-        "severity": severity_distribution(traces),
-        "agents": agent_performance(traces),
-        "rows": rows,
-    }
+    reviews = []
+    for i, t in enumerate(traces):
+        pr = t.get("pr", "?")
+        reviews.append({
+            "idx": i,
+            "pr": pr,
+            "repo": pr.split("#")[0],
+            "ts": t.get("timestamp", 0),
+            "confirmed": c(t, "confirmed"),
+            "refuted": c(t, "refuted"),
+            "suppressed": c(t, "suppressed"),
+            "latency": round(t.get("timings_ms", {}).get("total", 0) / 1000, 1),
+            "tokens": t.get("tokens", {}).get("total", 0),
+            "cost": t.get("cost_usd", 0),
+            "sev": sev_counts(t),
+            "findings": [{"agents": f.get("agents", ["?"]), "status": f.get("status")}
+                         for f in t.get("findings", [])],
+        })
     return (_DASHBOARD_TEMPLATE
             .replace("__CSS__", _BASE_CSS)
             .replace("__THEMEHEAD__", _THEME_HEAD)
             .replace("__THEMEJS__", _THEME_JS)
-            .replace("__DATA__", json.dumps(data)))
+            .replace("__DATA__", json.dumps({"reviews": reviews})))
 
 
 @app.get("/review/{idx}", response_class=HTMLResponse)
@@ -130,18 +118,23 @@ _BASE_CSS = """
   *{box-sizing:border-box}
   body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0;
        background:var(--bg);color:var(--text);padding:2.5rem 2rem 4rem;transition:background .2s,color .2s}
-  .wrap{max-width:1100px;margin:0 auto}
+  .wrap{max-width:1140px;margin:0 auto}
   a{color:var(--indigo);text-decoration:none}
   header{display:flex;align-items:center;gap:.6rem;margin-bottom:.25rem}
-  header h1{font-size:1.5rem;font-weight:700;margin:0}
+  header h1{font-size:1.4rem;font-weight:700;margin:0}
   .spacer{flex:1}
   .toggle{background:var(--card);border:1px solid var(--border);border-radius:8px;color:var(--text);
           padding:.45rem .7rem;cursor:pointer;font-size:.85rem}
-  .sub{color:var(--muted);font-size:.9rem;margin-bottom:2rem}
+  .sub{color:var(--muted);font-size:.9rem;margin-bottom:1.5rem}
+  .filters{display:flex;gap:.6rem;flex-wrap:wrap;margin-bottom:1.5rem;align-items:center}
+  .filters label{font-size:.78rem;color:var(--muted);margin-right:.2rem}
+  select{background:var(--card);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:.45rem .6rem;font-size:.85rem}
   .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1rem;margin-bottom:2rem}
   .kpi{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:1.1rem 1.3rem;box-shadow:var(--shadow)}
   .kpi .v{font-size:1.6rem;font-weight:750;letter-spacing:-.02em}
   .kpi .l{font-size:.8rem;color:var(--muted);margin-top:.2rem}
+  .kpi .t{font-size:.78rem;margin-top:.2rem;font-weight:650}
+  .up{color:var(--green)} .down{color:var(--red)}
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:1.25rem;margin-bottom:1.25rem}
   .panel{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:1.25rem 1.4rem;box-shadow:var(--shadow);margin-bottom:1.25rem}
   .panel h3{margin:0 0 1rem;font-size:.95rem;font-weight:650}
@@ -150,10 +143,12 @@ _BASE_CSS = """
   th,td{text-align:left;padding:.6rem .7rem;border-bottom:1px solid var(--border)}
   th{color:var(--muted);font-weight:600;font-size:.76rem;text-transform:uppercase;letter-spacing:.03em}
   td.num{font-variant-numeric:tabular-nums}
-  tr.clk{cursor:pointer}
-  tr.clk:hover{background:var(--grid)}
+  tr.clk{cursor:pointer} tr.clk:hover{background:var(--grid)}
   .empty{color:var(--muted);padding:3rem;text-align:center}
   .badge{display:inline-block;padding:.15rem .5rem;border-radius:999px;font-size:.72rem;font-weight:650;color:#fff}
+  .pill{display:inline-block;padding:.12rem .5rem;border-radius:999px;font-size:.78rem;font-weight:600}
+  .pill.ok{background:rgba(16,185,129,.15);color:#059669}
+  .pill.no{background:rgba(148,163,184,.2);color:#64748b}
   .chip{display:inline-block;background:var(--grid);color:var(--muted);border-radius:8px;padding:.3rem .6rem;font-size:.8rem;margin-right:.5rem}
   .bar{height:7px;border-radius:99px;background:var(--grid);overflow:hidden;margin-top:.3rem}
   .bar>span{display:block;height:100%;background:var(--indigo)}
@@ -165,7 +160,7 @@ _BASE_CSS = """
   .finding h4{margin:.1rem 0 .4rem;font-size:1rem}
   .finding .meta{font-size:.8rem;color:var(--muted);margin-bottom:.5rem}
   pre{background:var(--grid);border-radius:8px;padding:.6rem .8rem;overflow:auto;font-size:.82rem;margin:.5rem 0}
-  .agent-h{font-size:.9rem;font-weight:700;margin:1.4rem 0 .6rem;text-transform:capitalize}
+  .agent-h{font-size:.95rem;font-weight:700;margin:1.4rem 0 .6rem}
 """
 
 _THEME_HEAD = """<script>(function(){var t=localStorage.getItem('theme')||'light';
@@ -175,47 +170,110 @@ _THEME_JS = """
 function toggleTheme(){var c=document.documentElement.getAttribute('data-theme');
 localStorage.setItem('theme',c==='dark'?'light':'dark');location.reload();}
 var THEME=document.documentElement.getAttribute('data-theme');
+var AGENT_NAMES={security:'Security Agent',performance:'Performance Agent',
+architecture:'Code Quality Agent',testing:'Testing Agent',docs:'Documentation Agent',
+tools:'Static Analysis','?':'Unknown'};
+function agentName(a){return AGENT_NAMES[a]||(a.charAt(0).toUpperCase()+a.slice(1)+' Agent');}
 """
 
 _DASHBOARD_TEMPLATE = """<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AI Code Review — Dashboard</title>
+<title>AI Multi-Agent Code Review — Analytics</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
-__THEMEHEAD__
-<style>__CSS__</style></head><body><div class="wrap">
-  <header><span style="font-size:1.6rem">🤖</span><h1>AI Code Review</h1>
+__THEMEHEAD__<style>__CSS__</style></head><body><div class="wrap">
+  <header><span style="font-size:1.5rem">🤖</span><h1>AI Multi-Agent Code Review — Analytics</h1>
     <span class="spacer"></span>
     <button class="toggle" onclick="toggleTheme()">☀️ / 🌙</button></header>
-  <div class="sub">Observability dashboard · static analysis · specialist agents · adversarial verifier</div>
+  <div class="sub">Static analysis · specialist agents · adversarial verifier · observability</div>
+  <div class="filters">
+    <span><label>Repository</label><select id="repo"></select></span>
+    <span><label>Date range</label><select id="range">
+      <option value="all">All time</option><option value="30">Last 30 days</option>
+      <option value="7">Last 7 days</option><option value="1">Last 24 hours</option></select></span>
+  </div>
   <div class="kpis" id="kpis"></div>
   <div class="grid">
     <div class="panel"><h3>Findings per review</h3><div class="chart-box"><canvas id="findings"></canvas></div></div>
-    <div class="panel"><h3>Verifier outcomes (overall)</h3><div class="chart-box"><canvas id="outcomes"></canvas></div></div>
+    <div class="panel"><h3>Verifier outcomes</h3><div class="chart-box"><canvas id="outcomes"></canvas></div></div>
     <div class="panel"><h3>Severity distribution (confirmed)</h3><div class="chart-box"><canvas id="severity"></canvas></div></div>
-    <div class="panel"><h3>Latency per review (seconds)</h3><div class="chart-box"><canvas id="latency"></canvas></div></div>
+    <div class="panel"><h3>Reviews per day</h3><div class="chart-box"><canvas id="daily"></canvas></div></div>
   </div>
   <div class="panel"><h3>Agent performance</h3><div id="agents"></div></div>
   <div class="panel"><h3>Recent reviews <span style="font-weight:400;color:var(--muted);font-size:.8rem">— click a row for details</span></h3><div id="table"></div></div>
 </div>
 <script>
-const D = __DATA__;
+const REVIEWS = (__DATA__).reviews;
 __THEMEJS__
 const C={indigo:'#6366f1',green:'#10b981',amber:'#f59e0b',red:'#ef4444',slate:'#94a3b8'};
 const GRID=THEME==='dark'?'#1f2a3d':'#eef1f5';
 Chart.defaults.font.family="-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif";
 Chart.defaults.color=THEME==='dark'?'#94a3b8':'#64748b';
 Chart.defaults.plugins.legend.labels.boxWidth=12;
-document.getElementById('kpis').innerHTML=D.kpis.map(k=>`<div class="kpi"><div class="v">${k.value}</div><div class="l">${k.label}</div></div>`).join('');
 const g={scales:{x:{grid:{display:false}},y:{beginAtZero:true,grid:{color:GRID}}},plugins:{legend:{position:'bottom'}},maintainAspectRatio:false};
-if(D.labels.length){
-  new Chart(findings,{type:'bar',data:{labels:D.labels,datasets:[{label:'Confirmed',data:D.confirmed,backgroundColor:C.indigo,borderRadius:5},{label:'Refuted',data:D.refuted,backgroundColor:C.slate,borderRadius:5}]},options:g});
-  new Chart(outcomes,{type:'doughnut',data:{labels:['Confirmed','Refuted','Suppressed'],datasets:[{data:[D.totals.confirmed,D.totals.refuted,D.totals.suppressed],backgroundColor:[C.indigo,C.slate,C.amber],borderWidth:0}]},options:{maintainAspectRatio:false,cutout:'62%',plugins:{legend:{position:'bottom'}}}});
-  new Chart(severity,{type:'bar',indexAxis:'y',data:{labels:['Critical','High','Medium','Low'],datasets:[{data:[D.severity.critical,D.severity.high,D.severity.medium,D.severity.low],backgroundColor:[C.red,C.amber,C.indigo,C.slate],borderRadius:5}]},options:{...g,plugins:{legend:{display:false}}}});
-  new Chart(latency,{type:'line',data:{labels:D.labels,datasets:[{label:'Latency (s)',data:D.latency,borderColor:C.green,backgroundColor:'rgba(16,185,129,.12)',fill:true,tension:.35,pointRadius:3}]},options:{...g,plugins:{legend:{display:false}}}});
-}else{document.querySelector('.grid').innerHTML='<div class="empty">No reviews recorded yet.</div>';}
-document.getElementById('agents').innerHTML=D.agents.length?`<table><thead><tr><th>Agent</th><th>Findings</th><th>Confirmed</th><th>Refuted</th><th>Precision</th></tr></thead><tbody>${D.agents.map(a=>`<tr><td style="text-transform:capitalize">${a.agent}</td><td class="num">${a.findings}</td><td class="num">${a.confirmed}</td><td class="num">${a.refuted}</td><td class="num">${a.precision}%</td></tr>`).join('')}</tbody></table>`:'<div class="empty">No agent data yet.</div>';
-document.getElementById('table').innerHTML=D.rows.length?`<table><thead><tr><th>PR</th><th>Confirmed</th><th>Refuted</th><th>Agents</th><th>Latency</th><th>Cost</th></tr></thead><tbody>${D.rows.map(r=>`<tr class="clk" onclick="location.href='/review/${r.idx}'"><td>${r.pr}</td><td class="num">${r.confirmed}</td><td class="num">${r.refuted}</td><td>${r.agents}</td><td class="num">${r.latency} ms</td><td class="num">$${r.cost.toFixed(4)}</td></tr>`).join('')}</tbody></table>`:'<div class="empty">No reviews yet.</div>';
+
+// repo filter options
+const repos=[...new Set(REVIEWS.map(r=>r.repo))];
+const repoSel=document.getElementById('repo'), rangeSel=document.getElementById('range');
+repoSel.innerHTML='<option value="all">All repositories</option>'+repos.map(r=>`<option>${r}</option>`).join('');
+repoSel.onchange=render; rangeSel.onchange=render;
+
+const sum=(a,k)=>a.reduce((s,r)=>s+(r[k]||0),0);
+const mean=(a,k)=>a.length?sum(a,k)/a.length:0;
+function trend(cur,prev,goodUp){ if(!prev) return ''; const p=Math.round((cur-prev)/prev*100);
+  if(!p) return ''; const up=p>0, good=goodUp?up:!up;
+  return `<div class="t ${good?'up':'down'}">${up?'↑':'↓'}${Math.abs(p)}%</div>`; }
+
+let charts={};
+function render(){
+  const repo=repoSel.value, range=rangeSel.value, now=Date.now()/1000;
+  let R=REVIEWS.filter(r=>(repo==='all'||r.repo===repo) &&
+        (range==='all'|| now-r.ts <= (+range)*86400));
+  const half=Math.floor(R.length/2), older=R.slice(0,half), newer=R.slice(half);
+  const conf=sum(R,'confirmed'), ref=sum(R,'refuted'), judged=conf+ref, cost=R.reduce((s,r)=>s+r.cost,0);
+  const kpis=[
+    {v:R.length,l:'Reviews',t:trend(newer.length,older.length,true)},
+    {v:conf,l:'Findings confirmed',t:trend(sum(newer,'confirmed'),sum(older,'confirmed'),true)},
+    {v:ref,l:'Findings refuted',t:''},
+    {v:(judged?Math.round(ref/judged*100):0)+'%',l:'Refute rate',t:''},
+    {v:'$'+cost.toFixed(4),l:'Est. cost',t:trend(sum(newer,'cost'),sum(older,'cost'),false)},
+    {v:mean(R,'latency').toFixed(1)+'s',l:'Avg latency',t:trend(mean(newer,'latency'),mean(older,'latency'),false)},
+  ];
+  document.getElementById('kpis').innerHTML=kpis.map(k=>`<div class="kpi"><div class="v">${k.v}</div><div class="l">${k.l}</div>${k.t}</div>`).join('');
+
+  Object.values(charts).forEach(c=>c&&c.destroy()); charts={};
+  if(!R.length){document.querySelector('.grid').style.opacity=.4;}
+  else document.querySelector('.grid').style.opacity=1;
+  const labels=R.map(r=>r.pr.split('/').pop());
+  charts.f=new Chart(findings,{type:'bar',data:{labels,datasets:[
+    {label:'Confirmed',data:R.map(r=>r.confirmed),backgroundColor:C.indigo,borderRadius:5},
+    {label:'Refuted',data:R.map(r=>r.refuted),backgroundColor:C.slate,borderRadius:5}]},options:g});
+  charts.o=new Chart(outcomes,{type:'doughnut',data:{labels:['Confirmed','Refuted','Suppressed'],
+    datasets:[{data:[conf,ref,sum(R,'suppressed')],backgroundColor:[C.indigo,C.slate,C.amber],borderWidth:0}]},
+    options:{maintainAspectRatio:false,cutout:'62%',plugins:{legend:{position:'bottom'}}}});
+  const sev={critical:0,high:0,medium:0,low:0}; R.forEach(r=>Object.keys(sev).forEach(k=>sev[k]+=r.sev[k]||0));
+  charts.s=new Chart(severity,{type:'bar',indexAxis:'y',data:{labels:['Critical','High','Medium','Low'],
+    datasets:[{data:[sev.critical,sev.high,sev.medium,sev.low],backgroundColor:[C.red,C.amber,C.indigo,C.slate],borderRadius:5}]},
+    options:{...g,plugins:{legend:{display:false}}}});
+  const byDay={}; R.forEach(r=>{const d=new Date(r.ts*1000).toISOString().slice(5,10);byDay[d]=(byDay[d]||0)+1;});
+  const days=Object.keys(byDay).sort();
+  charts.d=new Chart(daily,{type:'bar',data:{labels:days,datasets:[{data:days.map(d=>byDay[d]),backgroundColor:C.green,borderRadius:5}]},
+    options:{...g,plugins:{legend:{display:false}}}});
+
+  // agent performance
+  const agg={}; R.forEach(r=>r.findings.forEach(f=>f.agents.forEach(a=>{
+    agg[a]=agg[a]||{findings:0,confirmed:0,refuted:0};
+    agg[a].findings++; agg[a][f.status==='confirmed'?'confirmed':'refuted']++; })));
+  const arows=Object.entries(agg).map(([a,v])=>({a,...v,p:v.findings?Math.round(v.confirmed/v.findings*100):0}))
+    .sort((x,y)=>y.findings-x.findings);
+  document.getElementById('agents').innerHTML=arows.length?`<table><thead><tr><th>Agent</th><th>Findings</th><th>Confirmed</th><th>Refuted</th><th>Precision</th></tr></thead><tbody>${arows.map(r=>`<tr><td>${agentName(r.a)}</td><td class="num">${r.findings}</td><td class="num">${r.confirmed}</td><td class="num">${r.refuted}</td><td class="num">${r.p}%</td></tr>`).join('')}</tbody></table>`:'<div class="empty">No agent data.</div>';
+
+  // recent table
+  const rows=[...R].reverse().slice(0,25);
+  document.getElementById('table').innerHTML=rows.length?`<table><thead><tr><th>PR</th><th>Confirmed</th><th>Refuted</th><th>Latency</th><th>Cost</th></tr></thead><tbody>${rows.map(r=>`<tr class="clk" onclick="location.href='/review/${r.idx}'"><td>${r.pr}</td><td><span class="pill ok">🟢 ${r.confirmed}</span></td><td><span class="pill no">🔴 ${r.refuted}</span></td><td class="num">${r.latency}s</td><td class="num">$${r.cost.toFixed(4)}</td></tr>`).join('')}</tbody></table>`:'<div class="empty">No reviews match these filters.</div>';
+}
+render();
 </script></body></html>"""
+
 
 _DETAIL_TEMPLATE = """<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -248,7 +306,7 @@ const byAgent={};
 let html='';
 if(!(T.findings||[]).length){html='<div class="panel empty">No findings recorded for this review.</div>';}
 Object.keys(byAgent).forEach(agent=>{
-  html+=`<div class="agent-h">${agent} agent</div><div class="panel">`;
+  html+=`<div class="agent-h">${agentName(agent)}</div><div class="panel">`;
   byAgent[agent].forEach(f=>{
     const ok=f.status==='confirmed';
     const conf=CONF[f.confidence]!==undefined?CONF[f.confidence]:60;
