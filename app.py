@@ -12,6 +12,7 @@ Run locally:  uvicorn app:app --reload --port 8000
 
 import hashlib
 import hmac
+import json
 import os
 import traceback
 
@@ -51,45 +52,139 @@ def stats() -> dict:
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard() -> str:
-    """A tiny self-contained HTML dashboard of recent reviews."""
+    """Professional light-theme dashboard with charts (Chart.js via CDN)."""
     traces = load_traces()
     s = compute_stats(traces)
-    recent = list(reversed(traces[-25:]))  # newest first
 
-    if not traces:
-        return "<h2>🤖 AI Code Review — Dashboard</h2><p>No reviews recorded yet.</p>"
+    def c(t, key):
+        return t.get("counts", {}).get(key, 0)
 
-    cards = "".join(
-        f"<div class='card'><div class='num'>{v}</div><div class='lbl'>{k.replace('_', ' ')}</div></div>"
-        for k, v in s.items()
-    )
-    rows = "".join(
-        f"<tr><td>{t.get('pr', '?')}</td>"
-        f"<td>{t.get('counts', {}).get('confirmed', 0)}</td>"
-        f"<td>{t.get('counts', {}).get('refuted', 0)}</td>"
-        f"<td>{', '.join(t.get('planned_agents', []))}</td>"
-        f"<td>{t.get('timings_ms', {}).get('total', 0)} ms</td>"
-        f"<td>{t.get('tokens', {}).get('total', 0)}</td></tr>"
-        for t in recent
-    )
-    return f"""
-    <html><head><title>AI Code Review Dashboard</title><style>
-      body{{font-family:system-ui,sans-serif;margin:2rem;background:#0d1117;color:#e6edf3}}
-      h2{{margin-bottom:1rem}}
-      .cards{{display:flex;flex-wrap:wrap;gap:1rem;margin-bottom:2rem}}
-      .card{{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:1rem 1.4rem;min-width:120px}}
-      .num{{font-size:1.8rem;font-weight:700;color:#58a6ff}}
-      .lbl{{font-size:.8rem;color:#8b949e;text-transform:capitalize}}
-      table{{width:100%;border-collapse:collapse}}
-      th,td{{text-align:left;padding:.5rem .6rem;border-bottom:1px solid #30363d;font-size:.9rem}}
-      th{{color:#8b949e}}
-    </style></head><body>
-      <h2>🤖 AI Code Review — Dashboard</h2>
-      <div class='cards'>{cards}</div>
-      <h3>Recent reviews</h3>
-      <table><tr><th>PR</th><th>Confirmed</th><th>Refuted</th><th>Agents</th><th>Latency</th><th>Tokens</th></tr>
-      {rows}</table>
-    </body></html>"""
+    # Chronological series for the charts.
+    labels = [t.get("pr", "?").split("/")[-1] for t in traces]
+    data = {
+        "kpis": [
+            {"label": "Reviews", "value": s.get("reviews", 0)},
+            {"label": "Findings confirmed", "value": s.get("total_confirmed", 0)},
+            {"label": "Findings refuted", "value": s.get("total_refuted", 0)},
+            {"label": "Refute rate", "value": f"{round(s.get('refute_rate', 0) * 100)}%"},
+            {"label": "Avg tokens / review", "value": f"{s.get('avg_tokens_per_review', 0):,}"},
+            {"label": "Avg latency", "value": f"{s.get('avg_latency_ms', 0) / 1000:.1f}s"},
+        ],
+        "labels": labels,
+        "confirmed": [c(t, "confirmed") for t in traces],
+        "refuted": [c(t, "refuted") for t in traces],
+        "totals": {
+            "confirmed": s.get("total_confirmed", 0),
+            "refuted": s.get("total_refuted", 0),
+            "suppressed": sum(c(t, "suppressed") for t in traces),
+        },
+        "latency": [round(t.get("timings_ms", {}).get("total", 0) / 1000, 1) for t in traces],
+        "tokens": [t.get("tokens", {}).get("total", 0) for t in traces],
+        "rows": [
+            {
+                "pr": t.get("pr", "?"),
+                "confirmed": c(t, "confirmed"),
+                "refuted": c(t, "refuted"),
+                "agents": ", ".join(t.get("planned_agents", [])),
+                "latency": t.get("timings_ms", {}).get("total", 0),
+                "tokens": t.get("tokens", {}).get("total", 0),
+            }
+            for t in reversed(traces[-25:])
+        ],
+    }
+    return _DASHBOARD_TEMPLATE.replace("__DATA__", json.dumps(data))
+
+
+_DASHBOARD_TEMPLATE = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Code Review — Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+  :root{
+    --bg:#f5f7fa; --card:#ffffff; --border:#e6e8ec; --text:#0f172a; --muted:#64748b;
+    --indigo:#6366f1; --green:#10b981; --amber:#f59e0b; --slate:#94a3b8;
+    --shadow:0 1px 3px rgba(15,23,42,.06),0 1px 2px rgba(15,23,42,.04);
+  }
+  *{box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+       margin:0;background:var(--bg);color:var(--text);padding:2.5rem 2rem 4rem}
+  .wrap{max-width:1100px;margin:0 auto}
+  header{display:flex;align-items:center;gap:.6rem;margin-bottom:.25rem}
+  header h1{font-size:1.5rem;font-weight:700;margin:0}
+  .sub{color:var(--muted);font-size:.9rem;margin-bottom:2rem}
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1rem;margin-bottom:2rem}
+  .kpi{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:1.1rem 1.3rem;box-shadow:var(--shadow)}
+  .kpi .v{font-size:1.7rem;font-weight:750;letter-spacing:-.02em}
+  .kpi .l{font-size:.8rem;color:var(--muted);margin-top:.2rem}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:1.25rem;margin-bottom:2rem}
+  .panel{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:1.25rem 1.4rem;box-shadow:var(--shadow)}
+  .panel h3{margin:0 0 1rem;font-size:.95rem;font-weight:650}
+  .chart-box{position:relative;height:240px}
+  table{width:100%;border-collapse:collapse;font-size:.88rem}
+  th,td{text-align:left;padding:.6rem .7rem;border-bottom:1px solid var(--border)}
+  th{color:var(--muted);font-weight:600;font-size:.78rem;text-transform:uppercase;letter-spacing:.03em}
+  td.num{font-variant-numeric:tabular-nums}
+  .empty{color:var(--muted);padding:3rem;text-align:center}
+</style></head>
+<body><div class="wrap">
+  <header><span style="font-size:1.6rem">🤖</span><h1>AI Code Review</h1></header>
+  <div class="sub">Observability dashboard · static analysis · specialist agents · adversarial verifier</div>
+  <div class="kpis" id="kpis"></div>
+  <div class="grid">
+    <div class="panel"><h3>Findings per review</h3><div class="chart-box"><canvas id="findings"></canvas></div></div>
+    <div class="panel"><h3>Verifier outcomes (overall)</h3><div class="chart-box"><canvas id="outcomes"></canvas></div></div>
+    <div class="panel"><h3>Latency per review (seconds)</h3><div class="chart-box"><canvas id="latency"></canvas></div></div>
+    <div class="panel"><h3>Tokens per review</h3><div class="chart-box"><canvas id="tokens"></canvas></div></div>
+  </div>
+  <div class="panel"><h3>Recent reviews</h3><div id="table"></div></div>
+</div>
+<script>
+const D = __DATA__;
+const C = {indigo:'#6366f1', green:'#10b981', amber:'#f59e0b', slate:'#94a3b8', muted:'#64748b'};
+Chart.defaults.font.family = "-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif";
+Chart.defaults.color = C.muted;
+Chart.defaults.plugins.legend.labels.boxWidth = 12;
+
+// KPI cards
+document.getElementById('kpis').innerHTML = D.kpis.map(k =>
+  `<div class="kpi"><div class="v">${k.value}</div><div class="l">${k.label}</div></div>`).join('');
+
+if (!D.labels.length) {
+  document.querySelector('.grid').innerHTML = '<div class="empty">No reviews recorded yet — run a review to populate the dashboard.</div>';
+} else {
+  const grid = {scales:{x:{grid:{display:false}},y:{beginAtZero:true,grid:{color:'#eef1f5'}}},
+                plugins:{legend:{position:'bottom'}},maintainAspectRatio:false};
+
+  new Chart(findings, {type:'bar', data:{labels:D.labels, datasets:[
+    {label:'Confirmed', data:D.confirmed, backgroundColor:C.indigo, borderRadius:5},
+    {label:'Refuted', data:D.refuted, backgroundColor:C.slate, borderRadius:5}]},
+    options:grid});
+
+  new Chart(outcomes, {type:'doughnut', data:{labels:['Confirmed','Refuted','Suppressed'],
+    datasets:[{data:[D.totals.confirmed,D.totals.refuted,D.totals.suppressed],
+    backgroundColor:[C.indigo,C.slate,C.amber],borderWidth:0}]},
+    options:{maintainAspectRatio:false,cutout:'62%',plugins:{legend:{position:'bottom'}}}});
+
+  new Chart(latency, {type:'line', data:{labels:D.labels, datasets:[
+    {label:'Latency (s)', data:D.latency, borderColor:C.green, backgroundColor:'rgba(16,185,129,.12)',
+     fill:true, tension:.35, pointRadius:3}]},
+    options:{...grid, plugins:{legend:{display:false}}}});
+
+  new Chart(tokens, {type:'bar', data:{labels:D.labels, datasets:[
+    {label:'Tokens', data:D.tokens, backgroundColor:C.indigo, borderRadius:5}]},
+    options:{...grid, plugins:{legend:{display:false}}}});
+}
+
+// Recent reviews table
+document.getElementById('table').innerHTML = D.rows.length ?
+  `<table><thead><tr><th>PR</th><th>Confirmed</th><th>Refuted</th><th>Agents</th><th>Latency</th><th>Tokens</th></tr></thead>
+   <tbody>${D.rows.map(r => `<tr><td>${r.pr}</td><td class="num">${r.confirmed}</td>
+   <td class="num">${r.refuted}</td><td>${r.agents}</td><td class="num">${r.latency} ms</td>
+   <td class="num">${r.tokens.toLocaleString()}</td></tr>`).join('')}</tbody></table>`
+  : '<div class="empty">No reviews yet.</div>';
+</script>
+</body></html>"""
 
 
 # ---------------------------------------------------------------------------
